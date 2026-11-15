@@ -2,6 +2,9 @@ import builtins
 import contextlib
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import date, datetime
@@ -9,6 +12,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+# 仓库测试不应作为青龙行情任务执行。兼容已经被误添加的测试任务。
+if __name__ == "__main__" and getattr(builtins, "QLAPI", None) is not None:
+    print("这是开发测试文件，请停用此任务并运行仓库根目录的 market_alert.py。")
+    raise SystemExit(0)
+
+# 直接执行 tests/test_market_alert.py 时，Python 默认只把 tests 加入模块路径。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import market_alert as m
 
 
@@ -344,6 +354,34 @@ class NotificationTests(unittest.TestCase):
         with patch.object(builtins, "QLAPI", SimpleNamespace(notify=Mock(return_value=False)), create=True):
             with self.assertRaises(RuntimeError):
                 m.send_notification("title", "body")
+
+
+class EntrypointTests(unittest.TestCase):
+    def test_test_script_runs_directly_from_an_unrelated_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+            env.pop("PYTHONPATH", None)
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "ConfigTests"],
+                cwd=directory, env=env, capture_output=True, encoding="utf-8", timeout=15,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Ran 4 tests", result.stderr)
+
+    def test_accidental_qinglong_test_task_exits_without_running_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # 模拟仅复制了测试文件、且青龙已注入 QLAPI 的脚本目录。
+            copied = Path(directory) / "test_market_alert.py"
+            copied.write_bytes(Path(__file__).read_bytes())
+            result = subprocess.run(
+                [sys.executable, "-c", "import builtins, runpy, sys; builtins.QLAPI = object(); runpy.run_path(sys.argv[1], run_name='__main__')", str(copied)],
+                cwd=directory, env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                capture_output=True, encoding="utf-8", timeout=15,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("请停用此任务", result.stdout)
+        self.assertIn("market_alert.py", result.stdout)
+        self.assertNotIn("Ran ", result.stderr)
 
 
 if __name__ == "__main__":
