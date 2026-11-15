@@ -12,12 +12,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-# 仓库测试不应作为青龙行情任务执行。兼容已经被误添加的测试任务。
+# 使用 .py.test 后缀，让青龙默认订阅只识别正式入口；仍可用 Python 直接运行。
+# 保留误执行保护，兼容手动将开发测试配置为青龙任务的情况。
 if __name__ == "__main__" and getattr(builtins, "QLAPI", None) is not None:
     print("这是开发测试文件，请停用此任务并运行仓库根目录的 market_alert.py。")
     raise SystemExit(0)
 
-# 直接执行 tests/test_market_alert.py 时，Python 默认只把 tests 加入模块路径。
+# 直接执行测试文件时，Python 默认只把 tests 加入模块路径。
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import market_alert as m
 
@@ -357,6 +358,16 @@ class NotificationTests(unittest.TestCase):
 
 
 class EntrypointTests(unittest.TestCase):
+    def test_default_subscription_only_finds_the_market_entrypoint(self):
+        candidates = []
+        for directory, subdirs, filenames in os.walk(m.ROOT):
+            subdirs[:] = [name for name in subdirs if not name.startswith(".") and name not in {"node_modules", "__pycache__", "venv"}]
+            for filename in filenames:
+                path = Path(directory) / filename
+                if path.suffix in {".py", ".js", ".ts", ".sh"}:
+                    candidates.append(path.relative_to(m.ROOT).as_posix())
+        self.assertEqual(candidates, ["market_alert.py"])
+
     def test_test_script_runs_directly_from_an_unrelated_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
