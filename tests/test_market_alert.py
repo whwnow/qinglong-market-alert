@@ -1,0 +1,350 @@
+import builtins
+import contextlib
+import io
+import json
+import tempfile
+import unittest
+from datetime import date, datetime
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import market_alert as m
+
+
+def at(value):
+    return datetime.fromisoformat(value).replace(tzinfo=m.BEIJING)
+
+
+class ConfigTests(unittest.TestCase):
+    def config(self, value):
+        return m.load_config({"MARKET_ALERT_CONFIG": json.dumps(value)})
+
+    def test_default_is_gold_only(self):
+        self.assertEqual(m.load_config({}).instruments, [m.Instrument("sge", "Au99.99")])
+
+    def test_all_supported_stock_code_formats_and_disabled_items(self):
+        config = self.config({"stocks": ["000001", "600519.SH", "bj920002", {"symbol": "sz300750", "enabled": False}], "gold": ["au99.99"]})
+        self.assertEqual([i.symbol for i in config.instruments], ["Au99.99", "sz000001", "sh600519", "bj920002"])
+
+    def test_rejects_mistakes_instead_of_silently_changing_watchlist(self):
+        cases = [
+            {"stocks": [1]}, {"stocks": ["sh000001"]}, {"stocks": ["00700"]},
+            {"stocks": ["000001", "sz000001"]}, {"gold": ["XAUUSD"]},
+            {"stocks": [{"symbol": "000001", "enabled": "false"}]},
+            {"timeout_seconds": 0}, {"stale_minutes": True}, {"stock": []},
+            {"calendar_overrides": {"sge": {"closed_dates": ["2026-02-30"]}}},
+            {"calendar_overrides": {"a_share": {"closed_dates": ["2026-11-16"], "open_dates": ["2026-11-16"]}}},
+        ]
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(m.ConfigError):
+                self.config(value)
+
+    def test_file_configuration_and_ambiguous_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text('{"stocks": ["000001"]}', encoding="utf-8-sig")
+            config = m.load_config({"MARKET_ALERT_CONFIG_FILE": str(path)})
+            self.assertEqual(config.instruments[0].symbol, "sz000001")
+            with self.assertRaises(m.ConfigError):
+                m.load_config({"MARKET_ALERT_CONFIG_FILE": str(path), "MARKET_ALERT_CONFIG": "{}"})
+
+
+class CalendarTests(unittest.TestCase):
+    def setUp(self):
+        self.calendar = m.CalendarStore(m.Config([]), Path("unused"), persist=False)
+
+    def test_a_share_boundaries_and_lunch(self):
+        for clock, opened in (("09:00", False), ("09:30", True), ("11:30", True), ("12:00", False), ("12:30", False), ("13:00", True), ("15:00", True), ("15:30", False)):
+            with self.subTest(clock=clock):
+                self.assertEqual(bool(self.calendar.session("a_share", at(f"2026-11-16T{clock}:00"))), opened)
+
+    def test_gold_continuous_day_session(self):
+        for clock, opened in (("08:30", False), ("09:00", True), ("11:30", True), ("12:00", True), ("13:00", True), ("15:30", True), ("16:00", False)):
+            with self.subTest(clock=clock):
+                self.assertEqual(bool(self.calendar.session("sge", at(f"2026-11-16T{clock}:00"))), opened)
+
+    def test_friday_night_continues_on_saturday_but_sunday_is_closed(self):
+        friday = self.calendar.session("sge", at("2026-11-13T20:00:00"))
+        saturday = self.calendar.session("sge", at("2026-11-14T02:30:00"))
+        self.assertEqual(friday.trading_day, date(2026, 11, 16))
+        self.assertEqual(saturday, friday)
+        self.assertIsNone(self.calendar.session("sge", at("2026-11-14T03:00:00")))
+        self.assertIsNone(self.calendar.session("sge", at("2026-11-14T20:00:00")))
+        self.assertIsNone(self.calendar.session("sge", at("2026-11-15T20:00:00")))
+        self.assertIsNone(self.calendar.session("sge", at("2026-11-16T01:00:00")))
+
+    def test_last_friday_before_spring_festival_has_no_night_session(self):
+        self.assertIsNotNone(self.calendar.session("sge", at("2026-02-13T15:30:00")))
+        self.assertIsNone(self.calendar.session("sge", at("2026-02-13T20:00:00")))
+        self.assertIsNone(self.calendar.session("sge", at("2026-02-14T00:30:00")))
+        self.assertIsNotNone(self.calendar.session("sge", at("2026-02-24T09:00:00")))
+        self.assertIsNone(self.calendar.session("sge", at("2026-02-24T01:00:00")))
+
+    def test_holidays_and_makeup_workdays_remain_closed(self):
+        for day in ("2026-10-01", "2026-10-10", "2026-02-28", "2026-09-20"):
+            for market in ("sge", "a_share"):
+                with self.subTest(day=day, market=market):
+                    self.assertIsNone(self.calendar.session(market, at(day + "T10:00:00")))
+
+    def test_calendar_overrides_apply_to_previous_nights_and_midnight(self):
+        config = m.Config([], calendar_overrides={"sge": {"closed_dates": ["2026-11-16"], "no_night_dates": ["2026-11-17"]}})
+        calendar = m.CalendarStore(config, Path("unused"))
+        self.assertFalse(calendar.night_open(date(2026, 11, 13)))
+        self.assertIsNone(calendar.session("sge", at("2026-11-18T00:30:00")))
+
+    def test_unknown_year_never_falls_back_to_weekdays(self):
+        with patch.object(self.calendar, "fetch_annual", side_effect=OSError("offline")):
+            with self.assertRaises(m.CalendarError):
+                self.calendar.session("a_share", at("2027-01-05T10:00:00"))
+
+    def test_cross_year_night_requires_next_year_calendar(self):
+        with patch.object(self.calendar, "fetch_annual", return_value={"closed_dates": ["2027-01-01"], "no_night_dates": []}):
+            self.assertFalse(self.calendar.night_open(date(2026, 12, 31)))
+
+    def test_expected_half_hour_counts(self):
+        for market, expected in (("sge", 14), ("a_share", 10)):
+            instants = [at("2026-11-16T00:00:00") + m.timedelta(minutes=30 * i) for i in range(48)]
+            count = sum(self.calendar.session(market, instant) is not None for instant in instants)
+            # 周一白天14次黄金、10次股票，另有周一20:00之后8次夜盘。
+            self.assertEqual(count, expected + (8 if market == "sge" else 0))
+
+
+class CalendarParsingTests(unittest.TestCase):
+    TEXT = """
+    <h1>关于2026年度部分节假日休市安排的公告</h1>
+    <p>一、元旦：1月1日（星期四）至1月3日（星期六）休市，2025年12月31日（星期三）晚上无夜市交易。</p>
+    <p>二、春节：2月15日（星期日）至2月23日（星期一）休市。2月13日（星期五）晚上无夜市交易。</p>
+    <p>三、清明节：4月4日（星期六）至4月6日（星期一）休市。4月3日（星期五）晚上无夜市交易。</p>
+    <p>四、劳动节：5月1日（星期五）至5月5日（星期二）休市。4月30日（星期四）晚上无夜市交易。</p>
+    <p>五、端午节：6月19日（星期五）至6月21日（星期日）休市。6月18日（星期四）晚上无夜市交易。</p>
+    <p>六、中秋节：9月25日（星期五）至9月27日（星期日）休市。9月24日（星期四）晚上无夜市交易。</p>
+    <p>七、国庆节：10月1日（星期四）至10月7日（星期三）休市。9月30日（星期三）晚上无夜市交易。</p>
+    """
+
+    def test_annual_announcement_ranges_and_previous_year_no_night(self):
+        result = m.parse_annual_calendar(self.TEXT, 2026, "sge")
+        self.assertIn("2026-02-23", result["closed_dates"])
+        self.assertIn("2025-12-31", result["no_night_dates"])
+        self.assertIn("2026-09-30", result["no_night_dates"])
+        self.assertEqual(len(result["no_night_dates"]), 7)
+
+    def test_incomplete_or_wrong_year_announcement_is_rejected(self):
+        incomplete = self.TEXT[:self.TEXT.index("<p>七、")]
+        for text, year in ((self.TEXT, 2027), (incomplete, 2026)):
+            with self.subTest(year=year), self.assertRaises(m.CalendarError):
+                m.parse_annual_calendar(text, year, "sge")
+
+    def test_combined_holiday_heading_preserves_both_closed_ranges(self):
+        text = self.TEXT.replace("六、中秋节：", "六、中秋节、国庆节：").replace("</p>\n    <p>七、国庆节：", "")
+        result = m.parse_annual_calendar(text, 2026, "sge")
+        self.assertIn("2026-09-25", result["closed_dates"])
+        self.assertIn("2026-10-07", result["closed_dates"])
+
+
+class QuoteTests(unittest.TestCase):
+    def setUp(self):
+        self.gold = m.Instrument("sge", "Au99.99")
+        self.stock = m.Instrument("a_share", "sz000001")
+
+    def test_gold_cross_midnight_selects_latest_datetime_not_clock_maximum(self):
+        records = [
+            {"时间": "23:59:00", "现价": 830, "更新时间": "2026年11月14日 00:31:55"},
+            {"时间": "00:30:00", "现价": 835, "更新时间": "2026年11月14日 00:31:55"},
+            {"时间": "00:31:00", "现价": 0, "更新时间": "2026年11月14日 00:31:55"},
+        ]
+        quote = m.gold_quote(self.gold, records, at("2026-11-14T00:32:00"), "test")
+        self.assertEqual(quote.price, 835)
+        self.assertEqual(quote.quoted_at, at("2026-11-14T00:30:00"))
+
+    def test_gold_zero_nan_and_future_updates_are_rejected(self):
+        for value in (0, "-", float("nan"), -100):
+            with self.subTest(value=value), self.assertRaises(m.QuoteError):
+                m.gold_quote(self.gold, [{"时间": "10:00:00", "现价": value, "更新时间": "2026年11月16日 10:01:00"}], at("2026-11-16T10:02:00"), "test")
+        with self.assertRaises(m.QuoteError):
+            m.gold_quote(self.gold, [{"时间": "10:00:00", "现价": 830, "更新时间": "2026年11月17日 10:01:00"}], at("2026-11-16T10:02:00"), "test")
+
+    def test_tencent_stock_fields_and_quote_time(self):
+        fields = [""] * 40
+        fields[1], fields[2], fields[3], fields[30], fields[32] = "平安银行", "000001", "12.07", "20261116103000", "2.37"
+        quote = m.tencent_quote(self.stock, 'v_sz000001="' + "~".join(fields) + '";', at("2026-11-16T10:30:05"))
+        self.assertEqual((quote.price, quote.change_pct), (12.07, 2.37))
+        self.assertEqual(quote.instrument.name, "平安银行")
+        self.assertEqual(quote.quoted_at, at("2026-11-16T10:30:00"))
+
+    def test_stale_prior_session_and_unknown_timestamp_are_visible(self):
+        calendar = m.CalendarStore(m.Config([]), Path("unused"))
+        session = calendar.session("a_share", at("2026-11-16T13:00:00"))
+        quote = m.Quote(self.stock, 12, "test", at("2026-11-16T13:00:00"), at("2026-11-16T11:30:00"))
+        status = " ".join(m.quote_status(quote, session, 10))
+        self.assertIn("行情延迟", status)
+        self.assertIn("上一时段价格", status)
+        quote.quoted_at = None
+        self.assertIn("无法核实延迟", " ".join(m.quote_status(quote, session, 10)))
+
+    def test_stock_source_failure_uses_fallback_only_once_per_run(self):
+        config = m.Config([self.stock])
+        provider = m.QuoteProvider(config, None, {})
+        provider.ak = SimpleNamespace(stock_bid_ask_em=Mock(side_effect=ConnectionError()))
+        fields = [""] * 40
+        fields[1], fields[2], fields[3], fields[30], fields[32] = "平安银行", "000001", "12.07", "20261116103000", "2.37"
+        response = Mock(text='v_sz000001="' + "~".join(fields) + '";')
+        with patch("requests.get", return_value=response):
+            first = provider.stock(self.stock)
+            second = provider.stock(self.stock)
+        self.assertEqual(first.price, second.price)
+        self.assertEqual(provider.ak.stock_bid_ask_em.call_count, 1)
+        self.assertEqual(first.source, "腾讯免费行情")
+
+    def test_gold_night_change_uses_previous_trading_day_close_and_caches_it(self):
+        calendar = m.CalendarStore(m.Config([]), Path("unused"))
+        session = calendar.session("sge", at("2026-11-13T20:30:00"))
+        realtime = Mock()
+        realtime.to_dict.return_value = [{"时间": "20:29:00", "现价": 840, "更新时间": "2026年11月13日 20:29:55"}]
+        history = Mock()
+        history.to_dict.return_value = [{"date": date(2026, 11, 12), "close": 810}, {"date": date(2026, 11, 13), "close": 800}]
+        provider = m.QuoteProvider(m.Config([self.gold]), calendar, {})
+        provider.ak = SimpleNamespace(spot_realtime_sge=Mock(return_value=realtime), spot_hist_sge=Mock(return_value=history))
+        first = provider.gold(self.gold, session)
+        second = provider.gold(self.gold, session)
+        self.assertAlmostEqual(first.change_pct, 5)
+        self.assertEqual(first.change_pct, second.change_pct)
+        provider.ak.spot_hist_sge.assert_called_once()
+
+    def test_gold_history_failure_does_not_lose_valid_spot_price(self):
+        calendar = m.CalendarStore(m.Config([]), Path("unused"))
+        session = calendar.session("sge", at("2026-11-16T10:00:00"))
+        realtime = Mock()
+        realtime.to_dict.return_value = [{"时间": "10:00:00", "现价": 840, "更新时间": "2026年11月13日 10:01:00"}]
+        provider = m.QuoteProvider(m.Config([self.gold]), calendar, {})
+        provider.ak = SimpleNamespace(spot_realtime_sge=Mock(return_value=realtime), spot_hist_sge=Mock(side_effect=ConnectionError()))
+        quote = provider.gold(self.gold, session)
+        self.assertEqual(quote.price, 840)
+        self.assertIsNone(quote.change_pct)
+        self.assertTrue(quote.notes)
+
+    def test_gold_adapter_failure_falls_back_to_same_sge_contract(self):
+        provider = m.QuoteProvider(m.Config([self.gold]), None, {})
+        provider.ak = SimpleNamespace(spot_realtime_sge=Mock(side_effect=ConnectionError()))
+        response = Mock()
+        response.json.return_value = {"heyue": "Au99.99", "times": ["10:00"], "data": [840], "delaystr": "2026年11月13日 10:01:00"}
+        with patch("requests.post", return_value=response) as request:
+            quote = provider.gold(self.gold, None)
+        self.assertEqual(quote.price, 840)
+        self.assertEqual(quote.source, "上金所公开行情")
+        self.assertEqual(request.call_args.kwargs["data"], {"instid": "Au99.99"})
+
+
+class ExecutionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name)
+        self.config = m.Config([m.Instrument("sge", "Au99.99"), m.Instrument("a_share", "sz000001")])
+        self.notify = Mock()
+        self.output = io.StringIO()
+        self.redirect = contextlib.redirect_stdout(self.output)
+        self.redirect.__enter__()
+        self.addCleanup(self.redirect.__exit__, None, None, None)
+
+    def provider(self, config, calendars, state):
+        return SimpleNamespace(fetch=lambda item, session: m.Quote(item, 830 if item.market == "sge" else 12, "test", at("2026-11-16T10:00:05"), at("2026-11-16T10:00:00")))
+
+    def run_script(self, instant, **kwargs):
+        return m.run(self.config, at(instant), self.path, provider_factory=self.provider, notify=self.notify, **kwargs)
+
+    def test_combined_push_and_same_slot_deduplication(self):
+        self.assertEqual(self.run_script("2026-11-16T10:00:00"), 0)
+        self.assertEqual(self.run_script("2026-11-16T10:00:59"), 0)
+        self.notify.assert_called_once()
+        content = self.notify.call_args.args[1]
+        self.assertIn("Au99.99", content)
+        self.assertIn("sz000001", content)
+        self.run_script("2026-11-16T10:30:00")
+        self.assertEqual(self.notify.call_count, 2)
+
+    def test_lunch_and_night_push_only_gold(self):
+        for instant in ("2026-11-16T12:00:00", "2026-11-14T01:30:00"):
+            self.run_script(instant, dry_run=True)
+            message = self.output.getvalue()
+            self.assertIn("Au99.99", message)
+            self.assertNotIn("sz000001", message)
+            self.output.seek(0)
+            self.output.truncate(0)
+
+    def test_outside_hours_and_non_half_hour_never_fetch(self):
+        for instant in ("2026-11-15T10:00:00", "2026-11-16T18:00:00", "2026-11-16T10:15:00"):
+            with patch.object(m, "QuoteProvider", side_effect=AssertionError("must not fetch")):
+                self.assertEqual(self.run_script(instant), 0)
+        self.notify.assert_not_called()
+        self.assertEqual(list(self.path.iterdir()), [])
+
+    def test_dry_run_check_and_force_do_not_write_or_notify(self):
+        self.run_script("2026-11-16T10:00:00", dry_run=True)
+        self.run_script("2026-11-15T18:03:00", dry_run=True, force=True)
+        self.run_script("2026-11-16T10:00:00", check=True)
+        self.notify.assert_not_called()
+        self.assertEqual(list(self.path.iterdir()), [])
+
+    def test_partial_failure_still_notifies_other_quotes(self):
+        def fetch(item, session):
+            if item.market == "sge":
+                raise m.QuoteError("黄金接口不可用")
+            return self.provider(None, None, None).fetch(item, session)
+
+        factory = lambda *args: SimpleNamespace(fetch=fetch)
+        code = m.run(self.config, at("2026-11-16T10:00:00"), self.path, provider_factory=factory, notify=self.notify)
+        self.assertEqual(code, 1)
+        content = self.notify.call_args.args[1]
+        self.assertIn("黄金接口不可用", content)
+        self.assertIn("12.00", content)
+
+    def test_failed_notification_does_not_mark_slot_as_sent(self):
+        self.notify.side_effect = RuntimeError("send failed")
+        with self.assertRaises(RuntimeError):
+            self.run_script("2026-11-16T10:00:00")
+        self.assertNotIn("last_slot", m.read_json(self.path / "state.json"))
+        self.notify.side_effect = None
+        self.run_script("2026-11-16T10:00:00")
+        self.assertEqual(self.notify.call_count, 2)
+
+    def test_missing_calendar_skips_affected_market_only(self):
+        config = m.Config(self.config.instruments, calendar_overrides={"sge": {"open_dates": ["2027-01-05"]}})
+        with patch.object(m.CalendarStore, "fetch_annual", side_effect=ConnectionError("offline")):
+            code = m.run(config, at("2027-01-05T10:00:00"), self.path, provider_factory=self.provider, notify=self.notify)
+        self.assertEqual(code, 1)
+        content = self.notify.call_args.args[1]
+        self.assertIn("Au99.99", content)
+        self.assertNotIn("sz000001", content)
+        self.assertIn("无法取得", content)
+
+    def test_state_lock_prevents_concurrent_notifications(self):
+        with m.state_lock(self.path):
+            with self.assertRaises(m.AlreadyRunning):
+                with m.state_lock(self.path):
+                    self.fail("lock should be exclusive")
+        with m.state_lock(self.path):
+            pass
+
+
+class NotificationTests(unittest.TestCase):
+    def test_uses_qinglong_builtin(self):
+        api = SimpleNamespace(notify=Mock())
+        with patch.object(builtins, "QLAPI", api, create=True):
+            m.send_notification("title", "body")
+        api.notify.assert_called_once_with("title", "body")
+
+    def test_falls_back_to_qinglong_module(self):
+        module = SimpleNamespace(send=Mock())
+        with patch.object(builtins, "QLAPI", None, create=True), patch.object(m.importlib, "import_module", return_value=module):
+            m.send_notification("title", "body")
+        module.send.assert_called_once_with("title", "body")
+
+    def test_explicit_notification_failure_is_not_recorded_as_success(self):
+        with patch.object(builtins, "QLAPI", SimpleNamespace(notify=Mock(return_value=False)), create=True):
+            with self.assertRaises(RuntimeError):
+                m.send_notification("title", "body")
+
+
+if __name__ == "__main__":
+    unittest.main()
