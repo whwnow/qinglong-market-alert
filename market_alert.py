@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 cron: 0,30 * * * *
+0,30 * * * * market_alert.py
 new Env('黄金与A股行情播报');
 
 青龙订阅入口。休市自动跳过；本地预览：python market_alert.py --dry-run --force
@@ -23,11 +24,15 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 
 BEIJING = timezone(timedelta(hours=8), "Asia/Shanghai")
 ROOT = Path(__file__).resolve().parent
+VERSION = "2026.11.16.1"
+EXPECTED_SCHEDULE = "0,30 * * * *"
 SGE_URL = "https://www.sge.com.cn"
 SSE_CALENDAR_URL = "https://www.sse.com.cn/disclosure/dealinstruc/closed/"
 HTTP_HEADERS = {
@@ -68,6 +73,10 @@ class QuoteError(RuntimeError):
 
 
 class AlreadyRunning(RuntimeError):
+    pass
+
+
+class NotificationError(RuntimeError):
     pass
 
 
@@ -113,6 +122,34 @@ class Quote:
 
 def log(message: str) -> None:
     print(message, flush=True)
+
+
+def error_detail(exc: Exception) -> str:
+    """保留可用于排查的错误种类和 HTTP 状态，不打印密钥、代理密码或响应正文。"""
+    name = type(exc).__name__
+    if isinstance(exc, (QuoteError, NotificationError, CalendarError)):
+        return str(exc)
+    if isinstance(exc, ModuleNotFoundError):
+        return f"缺少 Python 依赖 {exc.name}，请检查青龙 Python3 依赖安装日志"
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None):
+        host = urlsplit(getattr(response, "url", "") or "").hostname or "行情/通知来源"
+        return f"{name}：{host} 返回 HTTP {response.status_code}"
+    if "timeout" in name.lower():
+        return f"{name}：网络连接或读取超时"
+    if name == "Push2RateLimitError":
+        return "Push2RateLimitError：东方财富拒绝连接或限流"
+    if "ssl" in name.lower():
+        return f"{name}：TLS 连接或证书校验失败"
+    if "proxy" in name.lower():
+        return f"{name}：代理连接失败，请检查运行环境的代理配置"
+    if "connection" in name.lower():
+        return f"{name}：网络连接失败或被来源断开"
+    if isinstance(exc, PermissionError):
+        return "PermissionError：目录或文件没有访问权限，请检查运行状态目录"
+    if isinstance(exc, json.JSONDecodeError):
+        return "JSONDecodeError：来源返回了无效 JSON，可能是错误页或访问限制"
+    return name
 
 
 def canonical_stock(value: str) -> str:
@@ -403,28 +440,54 @@ def parse_datetime(value: Any) -> datetime:
     raise QuoteError("源端未提供可识别的行情日期和时间")
 
 
-def gold_quote(instrument: Instrument, records: list[dict], fetched_at: datetime, source: str) -> Quote:
+def gold_quote(instrument: Instrument, records: list[dict], fetched_at: datetime, source: str, session: Session | None = None) -> Quote:
     candidates = []
+    trading_date_used = False
     for row in records:
         price = number(row.get("现价"))
         if price is None or price <= 0:
             continue
         updated = parse_datetime(row.get("更新时间", ""))
+        night_date = (
+            session is not None and session.name == "夜盘"
+            and updated.date() == session.trading_day
+            and (updated.time() >= time(20) or updated.time() <= time(2, 30))
+        )
+        if night_date:
+            # 上金所夜盘 delaystr 的日期是交易日；周五夜盘甚至标为下周一。
+            actual_day = session.start.date() if updated.time() >= time(20) else session.end.date()
+            trading_date_used = trading_date_used or actual_day != updated.date()
+            updated = datetime.combine(actual_day, updated.time(), BEIJING)
         if updated > fetched_at + timedelta(minutes=2):
             raise QuoteError("源端更新时间晚于当前时间，未采用异常报价")
         try:
             point_time = time.fromisoformat(str(row["时间"]))
         except (KeyError, ValueError) as exc:
             raise QuoteError("黄金分时数据缺少有效时间") from exc
-        point = datetime.combine(updated.date(), point_time, BEIJING)
-        # 上金所数据按交易日排列，20:00 在 00:00 前；须重建跨日日期再选最新点。
-        if point > updated:
-            point -= timedelta(days=1)
+        if night_date:
+            if point_time >= time(20):
+                point_day = session.start.date()
+            elif point_time <= time(2, 30):
+                point_day = session.end.date()
+            else:
+                # 原始响应带全天曲线，夜盘尚未发生的日盘点不能作为最新价。
+                continue
+            point = datetime.combine(point_day, point_time, BEIJING)
+            if point > updated:
+                continue
+        else:
+            point = datetime.combine(updated.date(), point_time, BEIJING)
+            # 上金所数据按交易日排列，20:00 在 00:00 前；须重建跨日日期再选最新点。
+            if point > updated:
+                point -= timedelta(days=1)
         candidates.append((point, price))
     if not candidates:
         raise QuoteError("未取得有效黄金报价（空数据、零值或非数字）")
     quoted_at, price = max(candidates, key=lambda item: item[0])
-    return Quote(instrument, price, source, fetched_at, quoted_at)
+    quote = Quote(instrument, price, source, fetched_at, quoted_at)
+    if trading_date_used:
+        quote.notes.append("源端日期使用交易日，行情时间已按夜盘换算为北京时间")
+    return quote
 
 
 def tencent_quote(instrument: Instrument, text: str, fetched_at: datetime) -> Quote:
@@ -475,7 +538,7 @@ class QuoteProvider:
                 if self.config.stock_source == "akshare":
                     raise QuoteError(f"AKShare 股票取价失败（{type(exc).__name__}）") from exc
                 self.primary_failed = True
-                log(f"AKShare 股票接口不可用（{type(exc).__name__}），本次切换腾讯行情")
+                log(f"[取价] AKShare 股票接口不可用：{error_detail(exc)}；本次切换腾讯行情")
         if self.config.stock_source == "akshare":
             raise QuoteError("本次 AKShare 股票接口不可用")
         import requests
@@ -491,7 +554,7 @@ class QuoteProvider:
             if not records:
                 raise ValueError("AKShare 分时表为空")
         except Exception as exc:
-            log(f"{instrument.symbol} 的 AKShare 适配不可用（{type(exc).__name__}），尝试上金所公开行情")
+            log(f"[取价] {instrument.symbol} 的 AKShare 适配不可用：{error_detail(exc)}；尝试上金所公开行情")
             import requests
 
             response = requests.post(f"{SGE_URL}/graph/quotations", data={"instid": instrument.symbol}, headers={**HTTP_HEADERS, "Referer": SGE_URL + "/", "X-Requested-With": "XMLHttpRequest"}, timeout=self.config.timeout_seconds)
@@ -503,7 +566,7 @@ class QuoteProvider:
             source = "上金所公开行情"
         else:
             source = "上金所（AKShare）"
-        quote = gold_quote(instrument, records, datetime.now(BEIJING), source)
+        quote = gold_quote(instrument, records, datetime.now(BEIJING), source, session)
         if session:
             try:
                 previous = self.calendars.adjacent_day("sge", session.trading_day, -1)
@@ -522,7 +585,8 @@ class QuoteProvider:
                     quote.change_pct = (quote.price / close - 1) * 100
                 else:
                     quote.notes.append("前一交易日收盘价不可用，未计算涨跌幅")
-            except Exception:
+            except Exception as exc:
+                log(f"[取价] {instrument.symbol} 前收盘价获取失败：{error_detail(exc)}；保留现价")
                 quote.notes.append("前一交易日收盘价获取失败，未计算涨跌幅")
         return quote
 
@@ -567,10 +631,34 @@ def build_message(now: datetime, results: list[tuple[Instrument, Session | None,
     return title, "\n".join(lines)
 
 
-def send_notification(title: str, content: str) -> None:
+def send_notification(title: str, content: str) -> str:
     api = getattr(builtins, "QLAPI", None)
+    if api is not None and callable(getattr(api, "systemNotify", None)):
+        log("[通知] 使用青龙面板通知配置：QLAPI.systemNotify")
+        try:
+            result = api.systemNotify({"title": title, "content": content})
+        except Exception as exc:
+            raise NotificationError(f"青龙面板通知接口调用失败：{error_detail(exc)}") from exc
+        if not isinstance(result, dict) or result.get("code") != 200:
+            code = result.get("code", "未返回状态码") if isinstance(result, dict) else "未返回状态码"
+            raise NotificationError(f"青龙面板通知失败（code={code}），请在「系统设置 → 通知设置」检查配置并发送测试通知")
+        log("[通知] 青龙面板返回 code=200，确认通知发送成功")
+        return "青龙面板确认通知发送成功"
+
+    log("[通知] 当前环境无 systemNotify，使用青龙脚本通知配置")
+    if title in os.environ.get("SKIP_PUSH_TITLE", "").splitlines():
+        raise NotificationError("消息标题被 SKIP_PUSH_TITLE 过滤，未发送通知")
+    module = None
     if api is not None and callable(getattr(api, "notify", None)):
-        result = api.notify(title, content)
+        sender = api.notify
+        module = sys.modules.get("__ql_notify__")
+        if module is None:
+            try:
+                module = importlib.import_module("__ql_notify__")
+            except ModuleNotFoundError as exc:
+                if exc.name != "__ql_notify__":
+                    raise NotificationError(f"青龙通知模块缺少依赖：{exc.name}") from exc
+        route = "QLAPI.notify"
     else:
         sender = None
         for module_name in ("__ql_notify__", "notify"):
@@ -581,12 +669,50 @@ def send_notification(title: str, content: str) -> None:
                     break
             except ModuleNotFoundError as exc:
                 if exc.name != module_name:
-                    raise RuntimeError(f"青龙通知模块缺少依赖：{exc.name}") from exc
+                    raise NotificationError(f"青龙通知模块缺少依赖：{exc.name}") from exc
         if not callable(sender):
-            raise RuntimeError("未找到青龙通知模块；请通过青龙 task 运行，或使用 --dry-run 仅预览")
+            raise NotificationError("未找到青龙通知模块；请通过青龙 task 运行，或使用 --dry-run 仅预览")
+        route = module_name + ".send"
+    configured = getattr(module, "add_notify_function", None)
+    if callable(configured):
+        channels = configured()
+        if not channels or all(getattr(channel, "__name__", "") == "console" for channel in channels):
+            raise NotificationError("青龙脚本通知没有可发送消息的渠道；面板通知与脚本通知配置不同，请检查通知配置")
+        log("[通知] 已检测到脚本通知渠道：" + ", ".join(getattr(channel, "__name__", "自定义渠道") for channel in channels))
+    log(f"[通知] 调用 {route}")
+    try:
         result = sender(title, content)
-    if result is False:
-        raise RuntimeError("青龙通知模块返回发送失败")
+    except Exception as exc:
+        raise NotificationError(f"青龙脚本通知调用失败：{error_detail(exc)}") from exc
+    if result is False or (isinstance(result, dict) and result.get("code", 200) != 200):
+        raise NotificationError("青龙脚本通知模块返回发送失败，请查看上方渠道日志")
+    if result is None:
+        log("[通知] 脚本通知调用完成，但未返回发送结果；请查看上方渠道成功/失败日志")
+        return "青龙脚本通知已调用，渠道结果以通知日志为准"
+    log("[通知] 青龙脚本通知模块返回成功")
+    return "青龙脚本通知模块返回成功"
+
+
+def log_task_schedule() -> None:
+    """手动诊断时只读检查任务实际规则，不改动面板里已有的定时任务。"""
+    api = getattr(builtins, "QLAPI", None)
+    reader = getattr(api, "getCronDetail", None)
+    log_path = os.environ.get("real_log_path") or os.environ.get("log_path")
+    if not callable(reader) or not log_path:
+        log("[调度] 无法读取当前任务规则；若没有自动运行日志，请检查任务已启用且规则为 " + EXPECTED_SCHEDULE)
+        return
+    try:
+        response = reader({"log_path": log_path})
+        details = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(details, dict) or not isinstance(details.get("schedule"), str):
+            log("[调度] 青龙未返回当前任务规则；请检查任务已启用且规则为 " + EXPECTED_SCHEDULE)
+            return
+        schedule = details["schedule"].strip()
+        log(f"[调度] 青龙当前任务实际规则：{schedule}")
+        if schedule not in (EXPECTED_SCHEDULE, "0 " + EXPECTED_SCHEDULE, "*/30 * * * *", "0 */30 * * * *"):
+            log("[调度] 当前规则与半小时播报不一致；订阅更新可能保留旧任务，请将此任务规则改为 " + EXPECTED_SCHEDULE)
+    except Exception as exc:
+        log(f"[调度] 任务规则读取失败：{error_detail(exc)}；继续检查行情和通知")
 
 
 @contextlib.contextmanager
@@ -619,13 +745,18 @@ def state_lock(state_dir: Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False, force: bool = False, check: bool = False, provider_factory: Callable = QuoteProvider, notify: Callable = send_notification) -> int:
+def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False, force: bool = False, check: bool = False, manual: bool = False, provider_factory: Callable = QuoteProvider, notify: Callable = send_notification) -> int:
     now = now.astimezone(BEIJING)
+    diagnostic = force or manual
+    mode = "手动诊断" if manual else ("强制运行" if force else ("配置检查" if check else "按交易时段运行"))
+    log(f"[启动] v{VERSION}｜北京时间 {now:%Y-%m-%d %H:%M:%S}｜Python {sys.version.split()[0]}｜{mode}")
+    log(f"[调度] 半小时频率由青龙控制，期望定时规则：{EXPECTED_SCHEDULE}；脚本不再限制运行分钟")
+    log("[配置] 关注品种：" + (", ".join(item.symbol for item in config.instruments) or "空") + f"｜股票来源：{config.stock_source}")
+    if manual:
+        log("[诊断] 检测到青龙手动运行：检查全部关注品种及通知，休市也检查；不占用定时播报记录")
+        log_task_schedule()
     if not config.instruments:
         log("关注列表为空或已全部停用，本次不推送")
-        return 0
-    if now.minute % 30 and not (force or check):
-        log("当前不是整点/半点，本次跳过；手动预览可加 --dry-run --force")
         return 0
     calendars = CalendarStore(config, state_dir, persist=not dry_run and not check)
     active, warnings = [], []
@@ -633,11 +764,18 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
     for market in dict.fromkeys(item.market for item in config.instruments):
         try:
             sessions[market] = calendars.session(market, now)
+            session = sessions[market]
+            name = "上金所" if market == "sge" else "A 股"
+            if session:
+                log(f"[日历] {name}开市：{session.name} {session.start:%m-%d %H:%M}—{session.end:%m-%d %H:%M}，交易日 {session.trading_day}")
+            else:
+                log(f"[日历] {name}当前休市")
         except CalendarError as exc:
             warnings.append(str(exc))
+            log(f"[日历] {exc}")
             sessions[market] = None
     for item in config.instruments:
-        if force or sessions[item.market]:
+        if diagnostic or sessions[item.market]:
             active.append((item, sessions[item.market]))
     if check:
         log(json.dumps({"beijing_time": now.isoformat(), "instruments": [item.__dict__ for item in config.instruments], "active": [item.symbol for item, _ in active], "calendar_errors": warnings, "stock_source": config.stock_source}, ensure_ascii=False, indent=2))
@@ -650,35 +788,44 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
         state_path = state_dir / "state.json"
         state = read_json(state_path)
         slot = now.replace(second=0, microsecond=0).isoformat()
-        if not dry_run and not force and state.get("last_slot") == slot:
+        if not dry_run and not diagnostic and state.get("last_slot") == slot:
             log("当前时点已推送，本次跳过")
             return 0
         provider = provider_factory(config, calendars, state)
         results, failures = [], 0
         for item, session in active:
+            started = perf_counter()
+            log(f"[取价] 开始获取 {item.label}")
             try:
                 result = provider.fetch(item, session)
+                if diagnostic and session is None:
+                    result.notes.append("手动检查时该市场休市，以上为来源最后可用报价")
+                log(f"[取价] {item.symbol} 成功｜来源：{result.source}｜耗时 {perf_counter() - started:.1f} 秒")
             except Exception as exc:
                 failures += 1
-                # 不输出可能包含代理密码、访问令牌等信息的底层异常原文。
-                result = str(exc) if isinstance(exc, QuoteError) else f"行情来源暂不可用（{type(exc).__name__}），其余品种照常播报"
+                result = error_detail(exc)
+                log(f"[取价] {item.symbol} 失败｜{result}｜耗时 {perf_counter() - started:.1f} 秒")
             results.append((item, session, result))
         title, content = build_message(now, results, warnings, config)
+        if manual:
+            title = "手动检查｜" + title
         log(f"{title}\n\n{content}")
         if dry_run:
             log("\n预览完成，未发送通知，未写入运行状态")
         else:
-            notify(title, content)
-            state["last_slot"] = slot
+            receipt = notify(title, content)
+            if not diagnostic:
+                state["last_slot"] = slot
             write_json(state_path, state)
-            log("\n已调用青龙通知，并记录本次播报时点")
+            log("\n[完成] " + (receipt if isinstance(receipt, str) else "通知回调完成"))
+            log("[状态] 手动检查不占用定时播报记录" if diagnostic else "[状态] 已记录本次播报时点")
         return 1 if failures or warnings else 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="按各自交易时段播报黄金与 A 股行情")
     parser.add_argument("--dry-run", action="store_true", help="只输出消息，不通知、不写入状态")
-    parser.add_argument("--force", action="store_true", help="忽略交易时段、半小时限制和已推送状态，用于手动验证")
+    parser.add_argument("--force", action="store_true", help="忽略交易时段和已推送状态，用于手动验证")
     parser.add_argument("--check", action="store_true", help="检查配置和交易时段，不获取行情、不通知")
     parser.add_argument("--now", help="模拟北京时间，如 2026-11-16T10:00:00；仅用于 --dry-run 或 --check")
     args = parser.parse_args(argv)
@@ -692,7 +839,8 @@ def main(argv: list[str] | None = None) -> int:
         if now.tzinfo is None:
             now = now.replace(tzinfo=BEIJING)
         state_dir = Path(os.environ.get("MARKET_ALERT_STATE_DIR", str(ROOT / ".market-alert"))).expanduser()
-        return run(config, now, state_dir, dry_run=args.dry_run, force=args.force, check=args.check)
+        manual = os.environ.get("real_time", "").lower() == "true" and not (args.now or args.check)
+        return run(config, now, state_dir, dry_run=args.dry_run, force=args.force, check=args.check, manual=manual)
     except AlreadyRunning as exc:
         log(str(exc))
         return 0
@@ -700,8 +848,7 @@ def main(argv: list[str] | None = None) -> int:
         log(f"配置错误：{exc}")
         return 2
     except Exception as exc:
-        detail = str(exc) if type(exc) is RuntimeError else type(exc).__name__
-        log(f"任务失败：{detail}")
+        log(f"[失败] {error_detail(exc)}")
         return 1
 
 

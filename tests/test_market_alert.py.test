@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -168,6 +169,39 @@ class QuoteTests(unittest.TestCase):
         self.assertEqual(quote.price, 835)
         self.assertEqual(quote.quoted_at, at("2026-11-14T00:30:00"))
 
+    def test_gold_evening_trading_date_maps_to_current_calendar_date(self):
+        calendar = m.CalendarStore(m.Config([]), Path("unused"))
+        now = at("2026-11-16T21:49:00")
+        session = calendar.session("sge", now)
+        rows = [
+            {"时间": "21:45:00", "现价": 831.98, "更新时间": "2026年11月17日 21:45:56"},
+            {"时间": "21:46:00", "现价": 999, "更新时间": "2026年11月17日 21:45:56"},
+            {"时间": "15:30:00", "现价": 827.49, "更新时间": "2026年11月17日 21:45:56"},
+        ]
+        quote = m.gold_quote(self.gold, rows, now, "test", session)
+        self.assertEqual(quote.price, 831.98)
+        self.assertEqual(quote.quoted_at, at("2026-11-16T21:45:00"))
+        self.assertTrue(quote.notes)
+
+    def test_friday_and_saturday_quotes_labeled_monday_map_to_actual_night(self):
+        calendar = m.CalendarStore(m.Config([]), Path("unused"))
+        cases = [
+            ("2026-11-13T21:30:00", "2026年11月16日 21:29:55", "21:29:00", "2026-11-13T21:29:00"),
+            ("2026-11-14T00:32:00", "2026年11月16日 00:31:55", "00:31:00", "2026-11-14T00:31:00"),
+        ]
+        for instant, updated, point, expected in cases:
+            with self.subTest(instant=instant):
+                now = at(instant)
+                session = calendar.session("sge", now)
+                quote = m.gold_quote(self.gold, [{"时间": point, "现价": 830, "更新时间": updated}], now, "test", session)
+                self.assertEqual(quote.quoted_at, at(expected))
+
+    def test_future_night_clock_is_rejected_even_with_correct_trading_date(self):
+        calendar = m.CalendarStore(m.Config([]), Path("unused"))
+        now = at("2026-11-16T21:49:00")
+        with self.assertRaises(m.QuoteError):
+            m.gold_quote(self.gold, [{"时间": "22:00:00", "现价": 830, "更新时间": "2026年11月17日 22:01:00"}], now, "test", calendar.session("sge", now))
+
     def test_gold_zero_nan_and_future_updates_are_rejected(self):
         for value in (0, "-", float("nan"), -100):
             with self.subTest(value=value), self.assertRaises(m.QuoteError):
@@ -277,18 +311,43 @@ class ExecutionTests(unittest.TestCase):
     def test_lunch_and_night_push_only_gold(self):
         for instant in ("2026-11-16T12:00:00", "2026-11-14T01:30:00"):
             self.run_script(instant, dry_run=True)
-            message = self.output.getvalue()
+            message = self.output.getvalue().split("播报时点：", 1)[1]
             self.assertIn("Au99.99", message)
             self.assertNotIn("sz000001", message)
             self.output.seek(0)
             self.output.truncate(0)
 
-    def test_outside_hours_and_non_half_hour_never_fetch(self):
-        for instant in ("2026-11-15T10:00:00", "2026-11-16T18:00:00", "2026-11-16T10:15:00"):
-            with patch.object(m, "QuoteProvider", side_effect=AssertionError("must not fetch")):
-                self.assertEqual(self.run_script(instant), 0)
+    def test_outside_hours_never_fetch(self):
+        for instant in ("2026-11-15T10:00:00", "2026-11-16T18:00:00"):
+            factory = Mock(side_effect=AssertionError("must not fetch"))
+            self.assertEqual(m.run(self.config, at(instant), self.path, provider_factory=factory, notify=self.notify), 0)
+            factory.assert_not_called()
         self.notify.assert_not_called()
         self.assertEqual(list(self.path.iterdir()), [])
+
+    def test_delayed_start_and_arbitrary_minute_fetch_during_session(self):
+        for instant in ("2026-11-16T10:01:00", "2026-11-16T10:15:00"):
+            with self.subTest(instant=instant):
+                self.assertEqual(self.run_script(instant), 0)
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertNotIn("本次跳过", self.output.getvalue())
+
+    def test_manual_run_diagnoses_quotes_and_notification_even_outside_sessions(self):
+        self.assertEqual(self.run_script("2026-11-16T18:13:00", manual=True), 0)
+        title, content = self.notify.call_args.args
+        self.assertIn("手动检查", title)
+        self.assertIn("Au99.99", content)
+        self.assertIn("sz000001", content)
+        self.assertIn("休市", content)
+        self.assertNotIn("last_slot", m.read_json(self.path / "state.json"))
+
+    def test_manual_run_does_not_consume_or_overwrite_scheduled_slot(self):
+        self.run_script("2026-11-16T10:00:00")
+        scheduled = m.read_json(self.path / "state.json")["last_slot"]
+        self.run_script("2026-11-16T10:00:00", manual=True)
+        self.run_script("2026-11-16T10:03:00", manual=True)
+        self.assertEqual(m.read_json(self.path / "state.json")["last_slot"], scheduled)
+        self.assertEqual(self.notify.call_count, 3)
 
     def test_dry_run_check_and_force_do_not_write_or_notify(self):
         self.run_script("2026-11-16T10:00:00", dry_run=True)
@@ -341,7 +400,7 @@ class ExecutionTests(unittest.TestCase):
 class NotificationTests(unittest.TestCase):
     def test_uses_qinglong_builtin(self):
         api = SimpleNamespace(notify=Mock())
-        with patch.object(builtins, "QLAPI", api, create=True):
+        with patch.object(builtins, "QLAPI", api, create=True), patch.object(m.importlib, "import_module", side_effect=ModuleNotFoundError(name="__ql_notify__")):
             m.send_notification("title", "body")
         api.notify.assert_called_once_with("title", "body")
 
@@ -352,12 +411,97 @@ class NotificationTests(unittest.TestCase):
         module.send.assert_called_once_with("title", "body")
 
     def test_explicit_notification_failure_is_not_recorded_as_success(self):
-        with patch.object(builtins, "QLAPI", SimpleNamespace(notify=Mock(return_value=False)), create=True):
+        with patch.object(builtins, "QLAPI", SimpleNamespace(notify=Mock(return_value=False)), create=True), patch.object(m.importlib, "import_module", side_effect=ModuleNotFoundError(name="__ql_notify__")):
             with self.assertRaises(RuntimeError):
                 m.send_notification("title", "body")
 
+    def test_prefers_panel_configuration_and_checks_success_response(self):
+        api = SimpleNamespace(systemNotify=Mock(return_value={"code": 200}), notify=Mock())
+        with patch.object(builtins, "QLAPI", api, create=True):
+            receipt = m.send_notification("title", "body")
+        api.systemNotify.assert_called_once_with({"title": "title", "content": "body"})
+        api.notify.assert_not_called()
+        self.assertIn("确认", receipt)
+
+    def test_panel_failure_or_missing_response_is_an_error(self):
+        for result in ({"code": 400}, {"code": 500}, {}, None, False):
+            with self.subTest(result=result), patch.object(builtins, "QLAPI", SimpleNamespace(systemNotify=Mock(return_value=result)), create=True):
+                with self.assertRaises(m.NotificationError):
+                    m.send_notification("title", "body")
+
+    def test_no_script_channels_and_console_only_are_errors(self):
+        def console(*args):
+            pass
+
+        for channels in ([], [console]):
+            sender = Mock()
+            module = SimpleNamespace(send=sender, add_notify_function=lambda: channels)
+            with self.subTest(channels=channels), patch.object(builtins, "QLAPI", None, create=True), patch.object(m.importlib, "import_module", return_value=module):
+                with self.assertRaises(m.NotificationError):
+                    m.send_notification("title", "body")
+            sender.assert_not_called()
+
+    def test_notification_exceptions_do_not_expose_tokens_or_proxy_credentials(self):
+        api = SimpleNamespace(systemNotify=Mock(side_effect=ConnectionError("https://user:password@host/?token=private")))
+        with patch.object(builtins, "QLAPI", api, create=True), self.assertRaises(m.NotificationError) as caught:
+            m.send_notification("title", "body")
+        self.assertNotIn("private", str(caught.exception))
+        self.assertNotIn("password", str(caught.exception))
+
+    def test_script_notification_none_result_is_reported_as_unconfirmed(self):
+        module = SimpleNamespace(send=Mock(return_value=None))
+        with patch.object(builtins, "QLAPI", None, create=True), patch.object(m.importlib, "import_module", return_value=module):
+            receipt = m.send_notification("title", "body")
+        self.assertIn("日志", receipt)
+        self.assertNotIn("成功", receipt)
+
+    def test_rejected_panel_notification_does_not_record_scheduled_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = m.Config([m.Instrument("sge", "Au99.99")])
+            provider = SimpleNamespace(fetch=lambda item, session: m.Quote(item, 830, "test", at("2026-11-16T10:00:00")))
+            api = SimpleNamespace(systemNotify=Mock(return_value={"code": 400}))
+            with patch.object(builtins, "QLAPI", api, create=True), self.assertRaises(m.NotificationError):
+                m.run(config, at("2026-11-16T10:00:00"), Path(directory), provider_factory=lambda *args: provider)
+            self.assertNotIn("last_slot", m.read_json(Path(directory) / "state.json"))
+
 
 class EntrypointTests(unittest.TestCase):
+    def test_manual_schedule_diagnostics_report_mismatch_without_editing_task(self):
+        api = SimpleNamespace(getCronDetail=Mock(return_value={"code": 200, "data": {"schedule": "17 18 * * *"}}))
+        output = io.StringIO()
+        with patch.object(builtins, "QLAPI", api, create=True), patch.dict(os.environ, {"real_log_path": "market/run.log"}), contextlib.redirect_stdout(output):
+            m.log_task_schedule()
+        api.getCronDetail.assert_called_once_with({"log_path": "market/run.log"})
+        self.assertIn("17 18 * * *", output.getvalue())
+        self.assertIn("不一致", output.getvalue())
+
+    def test_schedule_lookup_failure_keeps_diagnosis_available(self):
+        api = SimpleNamespace(getCronDetail=Mock(side_effect=ConnectionError("private endpoint")))
+        output = io.StringIO()
+        with patch.object(builtins, "QLAPI", api, create=True), patch.dict(os.environ, {"real_log_path": "market/run.log"}), contextlib.redirect_stdout(output):
+            m.log_task_schedule()
+        self.assertIn("继续检查", output.getvalue())
+        self.assertNotIn("private endpoint", output.getvalue())
+
+    def test_both_filename_and_explicit_cron_annotations_match(self):
+        source = (m.ROOT / "market_alert.py").read_text(encoding="utf-8")
+        explicit = re.search(r"\bcron:\s*([^\r\n]+)", source)[1].strip()
+        filename_lines = [line for line in source.splitlines() if "market_alert.py" in line]
+        legacy = [match[0] for line in filename_lines if (match := re.search(r"(?:[\d*][\d*/,-]*\s+){4,5}[\d*][\d*/,-]*", line))]
+        self.assertEqual(explicit, m.EXPECTED_SCHEDULE)
+        self.assertEqual(legacy, [m.EXPECTED_SCHEDULE])
+
+    def test_main_detects_qinglong_manual_run_without_extra_arguments(self):
+        with patch.dict(os.environ, {"real_time": "true", "MARKET_ALERT_CONFIG": "{}", "MARKET_ALERT_CONFIG_FILE": ""}), patch.object(m, "run", return_value=0) as run:
+            self.assertEqual(m.main([]), 0)
+        self.assertTrue(run.call_args.kwargs["manual"])
+
+    def test_main_does_not_treat_scheduled_or_check_runs_as_manual(self):
+        for env, arguments in (({"real_time": "false"}, []), ({"real_time": "true"}, ["--check"])):
+            with self.subTest(env=env, arguments=arguments), patch.dict(os.environ, {**env, "MARKET_ALERT_CONFIG": "{}", "MARKET_ALERT_CONFIG_FILE": ""}), patch.object(m, "run", return_value=0) as run:
+                self.assertEqual(m.main(arguments), 0)
+            self.assertFalse(run.call_args.kwargs["manual"])
+
     def test_default_subscription_only_finds_the_market_entrypoint(self):
         candidates = []
         for directory, subdirs, filenames in os.walk(m.ROOT):
