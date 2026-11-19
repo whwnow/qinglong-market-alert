@@ -5,7 +5,9 @@
   "stocks": [
     {"symbol": "sh600519", "name": "贵州茅台", "enabled": true},
     {"symbol": "sz000001", "name": "平安银行", "enabled": true},
-    {"symbol": "bj920002", "name": "万达轴承", "enabled": false}
+    {"symbol": "bj920002", "name": "万达轴承", "enabled": false},
+    {"symbol": "510300", "name": "沪深300ETF", "enabled": true},
+    {"symbol": "159915", "name": "创业板ETF", "enabled": true}
   ],
   "hk_stocks": ["00700"],
   "hk_connect": ["09988"],

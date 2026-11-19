@@ -62,6 +62,119 @@ class ConfigTests(unittest.TestCase):
                 m.load_config({"MARKET_ALERT_CONFIG_FILE": str(path), "MARKET_ALERT_CONFIG": "{}"})
 
 
+class MainlandETFTests(unittest.TestCase):
+    def config(self, stocks):
+        return m.load_config({"MARKET_ALERT_CONFIG": json.dumps({"stocks": stocks})})
+
+    def response(self, code="510300", name="沪深300ETF华泰柏瑞", price="4.063", change="0.12"):
+        fields = [""] * 40
+        fields[1], fields[2], fields[3], fields[30], fields[32] = name, code, price, "20261119103000", change
+        prefix = "sz" if code.startswith("159") else "sh"
+        return Mock(text='v_' + prefix + code + '="' + "~".join(fields) + '";')
+
+    def test_both_exchanges_code_formats_and_new_shanghai_etf_ranges(self):
+        config = self.config(["510300", "159915.SZ", "sh588000", "513100.SH", "511010", "518880", "520880", "530300", "560010", "159001"])
+        self.assertEqual([i.symbol for i in config.instruments], ["sh510300", "sz159915", "sh588000", "sh513100", "sh511010", "sh518880", "sh520880", "sh530300", "sh560010", "sz159001"])
+        self.assertTrue(all(item.market == "a_share" and item.is_mainland_etf for item in config.instruments))
+        self.assertFalse(self.config(["600519"]).instruments[0].is_mainland_etf)
+        self.assertFalse(m.Instrument("hk_share", "hk05100").is_mainland_etf)
+
+    def test_rejects_wrong_exchange_duplicates_and_unsupported_fund_categories(self):
+        for stocks in ([510300], ["sz510300"], ["sh159915"], ["510300.SZ"], ["159915.BJ"], ["510300", "510300.SH"], ["159915", "sz159915"], ["160119"], ["501018"], ["508000"], ["110000"]):
+            with self.subTest(stocks=stocks), self.assertRaises(m.ConfigError):
+                self.config(stocks)
+        self.assertEqual(self.config([{"symbol": "510300", "enabled": False}, "600519"]).instruments, [m.Instrument("a_share", "sh600519")])
+
+    def test_etf_uses_exact_single_symbol_quote_with_all_stock_source_modes(self):
+        for source in ("auto", "akshare", "tencent"):
+            for symbol in ("510300", "159915"):
+                with self.subTest(source=source, symbol=symbol):
+                    item = self.config([symbol]).instruments[0]
+                    provider = m.QuoteProvider(m.Config([item], stock_source=source), None, {})
+                    with patch.object(provider, "akshare", side_effect=AssertionError("ETF cannot use stock or full-market adapters")), patch("requests.get", return_value=self.response(symbol)) as get:
+                        quote = provider.fetch(item, None)
+                    self.assertEqual(get.call_args.args[0], f"https://qt.gtimg.cn/q={item.symbol}")
+                    self.assertEqual(quote.source, "腾讯免费行情")
+                    self.assertEqual(quote.instrument.name, "沪深300ETF华泰柏瑞")
+                    self.assertEqual(quote.quoted_at, at("2026-11-19T10:30:00"))
+                    self.assertFalse(provider.primary_failed)
+
+    def test_etf_routing_does_not_disable_akshare_for_regular_stocks(self):
+        etf, stock = self.config(["510300", {"symbol": "600519", "name": "贵州茅台"}]).instruments
+        fields = Mock()
+        fields.itertuples.return_value = [("最新", 1460.21), ("涨幅", 1.22)]
+        provider = m.QuoteProvider(m.Config([etf, stock]), None, {})
+        provider.ak = SimpleNamespace(stock_bid_ask_em=Mock(return_value=fields))
+        with patch("requests.get", return_value=self.response()) as get:
+            self.assertEqual(provider.fetch(etf, None).source, "腾讯免费行情")
+            self.assertEqual(provider.fetch(stock, None).source, "东方财富（AKShare）")
+        provider.ak.stock_bid_ask_em.assert_called_once_with(symbol="600519")
+        self.assertEqual(get.call_count, 1)
+
+    def test_etf_name_three_decimal_precision_and_units_in_mixed_message(self):
+        etf, stock = self.config([{"symbol": "510300", "name": "我的沪深300"}, "600519"]).instruments
+        now = at("2026-11-19T10:30:05")
+        quote = m.tencent_quote(etf, self.response().text, now)
+        self.assertEqual(quote.instrument.name, "我的沪深300")
+        self.assertEqual((quote.price, quote.change_pct, quote.currency), (4.063, 0.12, "CNY"))
+        title, content = m.build_message(now, [(etf, None, quote), (stock, None, m.Quote(stock, 1460.21, "test", now))], [], m.Config([etf, stock]))
+        self.assertIn("ETF", title)
+        self.assertIn("我的沪深300 (sh510300)｜沪市 ETF", content)
+        self.assertIn("现价：4.063 元/份｜涨跌幅：+0.12%", content)
+        self.assertIn("现价：1,460.21 元/股", content)
+        self.assertIn("非基金净值或 IOPV 估值", content)
+        self.assertIn("前一交易日收盘价", content)
+        # 保留低价 ETF 的最小报价单位，不因两位小数格式显示为零。
+        quote.price = 0.001
+        _, tiny = m.build_message(now, [(etf, None, quote)], [], m.Config([etf]))
+        self.assertIn("0.001 元/份", tiny)
+
+    def test_invalid_or_mismatched_etf_quotes_are_not_sent_as_valid_prices(self):
+        item = self.config(["510300"]).instruments[0]
+        for price in ("0", "-1", "NaN", "", "--"):
+            with self.subTest(price=price), self.assertRaises(m.QuoteError):
+                m.tencent_quote(item, self.response(price=price).text, at("2026-11-19T10:30:05"))
+        wrong = self.response(code="510500").text.replace("v_sh510500", "v_sh510300")
+        with self.assertRaises(m.QuoteError):
+            m.tencent_quote(item, wrong, at("2026-11-19T10:30:05"))
+
+    def test_stock_and_etf_combined_notifications_use_mainland_sessions(self):
+        config = self.config(["600519", "510300", "159915", "513100", "518880", "520880"])
+        for instant, expected_calls in (("2026-11-19T09:30:00", 6), ("2026-11-19T11:30:00", 6), ("2026-11-19T12:00:00", 0), ("2026-11-19T13:00:00", 6), ("2026-11-19T15:00:00", 6), ("2026-11-19T15:30:00", 0), ("2026-11-19T22:30:00", 0), ("2026-11-15T10:00:00", 0), ("2026-10-01T10:00:00", 0), ("2026-09-25T10:00:00", 0)):
+            with self.subTest(instant=instant), tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+                now = at(instant)
+                fetch = Mock(side_effect=lambda item, session: m.Quote(item, 4.063, "test", now, now))
+                notify = Mock()
+                result = m.run(config, now, Path(directory), provider_factory=lambda *args: SimpleNamespace(fetch=fetch), notify=notify)
+                self.assertEqual(result, 0)
+                self.assertEqual(fetch.call_count, expected_calls)
+                self.assertEqual(notify.call_count, int(expected_calls > 0))
+                if expected_calls:
+                    self.assertEqual({call.args[1].market for call in fetch.call_args_list}, {"a_share"})
+                    self.assertIn("深市 ETF", notify.call_args.args[1])
+                    self.assertIn("元/份", notify.call_args.args[1])
+
+    def test_etf_failure_does_not_drop_other_quotes_and_manual_diagnosis_still_works(self):
+        config = self.config(["510300", "159915"])
+        for instant, manual in (("2026-11-19T10:30:00", False), ("2026-11-19T20:17:00", True)):
+            with self.subTest(manual=manual), tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+                now = at(instant)
+                def fetch(item, session):
+                    if item.symbol == "sh510300":
+                        raise m.QuoteError("该 ETF 来源暂不可用")
+                    return m.Quote(item, 2.308, "test", now, now)
+                notify = Mock()
+                result = m.run(config, now, Path(directory), provider_factory=lambda *args: SimpleNamespace(fetch=fetch), notify=notify, manual=manual)
+                self.assertEqual(result, 1)
+                content = notify.call_args.args[1]
+                self.assertIn("该 ETF 来源暂不可用", content)
+                self.assertIn("2.308 元/份", content)
+                if manual:
+                    self.assertIn("手动检查", notify.call_args.args[0])
+                    self.assertIn("休市", content)
+                    self.assertNotIn("last_slot", m.read_json(Path(directory) / "state.json"))
+
+
 class MultiMarketConfigTests(unittest.TestCase):
     def config(self, value):
         return m.load_config({"MARKET_ALERT_CONFIG": json.dumps(value)})

@@ -35,10 +35,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 BEIJING = timezone(timedelta(hours=8), "Asia/Shanghai")
 ROOT = Path(__file__).resolve().parent
-VERSION = "2026.11.19.1"
+VERSION = "2026.11.19.2"
 EXPECTED_SCHEDULE = "0,30 * * * *"
 MARKET_NAMES = {"sge": "上金所", "a_share": "A 股", "hk_share": "港股", "hk_connect": "港股通", "us_share": "美股", "crypto": "加密货币现货"}
 HKEX_CALENDAR_URL = "https://www.hkex.com.hk/-/media/HKEX-Market/Mutual-Market/Stock-Connect/Reference-Materials/Trading-Hour,-Trading-and-Settlement-Calendar/{year}-Calendar_csv_e.csv"
+# 沪市 ETF 代码段含 51/52/53/56/58，深市 ETF 使用 159；不接受场外基金和 LOF 代码。
+MAINLAND_ETF_PREFIXES = {"sh": ("51", "52", "53", "56", "58"), "sz": ("159",)}
 SGE_URL = "https://www.sge.com.cn"
 SSE_CALENDAR_URL = "https://www.sse.com.cn/disclosure/dealinstruc/closed/"
 HTTP_HEADERS = {
@@ -102,6 +104,14 @@ class Instrument:
     @property
     def label(self) -> str:
         return f"{self.name} ({self.symbol})" if self.name else self.symbol
+
+    @property
+    def is_mainland_etf(self) -> bool:
+        return self.market == "a_share" and any(
+            self.symbol.startswith(exchange + prefix)
+            for exchange, prefixes in MAINLAND_ETF_PREFIXES.items()
+            for prefix in prefixes
+        )
 
 
 @dataclass
@@ -174,15 +184,16 @@ def canonical_stock(value: str) -> str:
         value = suffix[2] + suffix[1]
     match = re.fullmatch(r"(?:(sh|sz|bj))?(\d{6})", value)
     if not match:
-        raise ConfigError(f"无效的 A 股代码：{value}")
+        raise ConfigError(f"无效的 A 股或场内 ETF 代码：{value}")
     prefix, code = match.groups()
-    expected = "sh" if code.startswith("6") else (
+    etf_market = next((exchange for exchange, prefixes in MAINLAND_ETF_PREFIXES.items() if code.startswith(prefixes)), None)
+    expected = etf_market or ("sh" if code.startswith("6") else (
         "sz" if code.startswith(("0", "3")) else (
             "bj" if code.startswith(("4", "8", "92")) else None
         )
-    )
+    ))
     if not expected or (prefix and prefix != expected):
-        raise ConfigError(f"A 股市场与代码不匹配：{value}")
+        raise ConfigError(f"A 股或场内 ETF 市场与代码不匹配：{value}")
     return expected + code
 
 
@@ -647,6 +658,8 @@ def tencent_quote(instrument: Instrument, text: str, fetched_at: datetime) -> Qu
         raise QuoteError("股票未返回有效成交价，可能尚未成交或已停牌")
     currency, notes = "CNY", []
     zone = BEIJING
+    if instrument.is_mainland_etf:
+        notes.append("场内成交价，非基金净值或 IOPV 估值；按沪深交易时段播报")
     if instrument.market == "us_share":
         if len(fields) <= 35 or fields[35] != "USD":
             raise QuoteError("美股来源未提供可识别的美元报价")
@@ -712,6 +725,10 @@ class QuoteProvider:
         return self.ak
 
     def stock(self, instrument: Instrument) -> Quote:
+        if instrument.is_mainland_etf:
+            # AKShare 个股接口按 6 开头判断沪市，会把沪市 5 开头的 ETF 发往深市。
+            # ETF 直接读腾讯单品种行情，同时避免分页获取全市场 ETF。
+            return self.tencent(instrument)
         if self.config.stock_source != "tencent" and not self.primary_failed:
             try:
                 ak = self.akshare()
@@ -842,7 +859,10 @@ def quote_status(quote: Quote, session: Session | None, stale_minutes: float) ->
 
 
 def build_message(now: datetime, results: list[tuple[Instrument, Session | None, Quote | str]], warnings: list[str], config: Config) -> tuple[str, str]:
-    title = f"{'多市场行情' if any(item.market not in {'sge', 'a_share'} for item in config.instruments) else '黄金与A股行情'} {now:%m-%d %H:%M}"
+    topic = "多市场行情" if any(item.market not in {"sge", "a_share"} for item in config.instruments) else (
+        "黄金与A股/ETF行情" if any(item.is_mainland_etf for item in config.instruments) else "黄金与A股行情"
+    )
+    title = f"{topic} {now:%m-%d %H:%M}"
     lines = [f"播报时点：{now:%Y-%m-%d %H:%M}（北京时间）"]
     for instrument, session, result in results:
         lines.append("")
@@ -852,7 +872,11 @@ def build_message(now: datetime, results: list[tuple[Instrument, Session | None,
         currency = result.currency or (instrument.symbol.split("/")[1] if instrument.market == "crypto" else "USD" if instrument.market == "us_share" else "HKD" if instrument.market in {"hk_share", "hk_connect"} else "CNY")
         currency_name = {"CNY": "元", "HKD": "港元", "USD": "美元"}.get(currency, currency)
         unit = "元/克" if instrument.market == "sge" else f"{currency_name}/股"
-        price = f"{result.price:,.3f}" if instrument.market in {"hk_share", "hk_connect"} else f"{result.price:,.2f}"
+        price = f"{result.price:,.3f}" if instrument.is_mainland_etf or instrument.market in {"hk_share", "hk_connect"} else f"{result.price:,.2f}"
+        market_name = MARKET_NAMES[instrument.market]
+        if instrument.is_mainland_etf:
+            unit = "元/份"
+            market_name = "沪市 ETF" if instrument.symbol.startswith("sh") else "深市 ETF"
         change_label = "涨跌幅"
         if instrument.market == "crypto":
             unit = f"{currency}/{instrument.symbol.split('/')[0]}"
@@ -862,7 +886,7 @@ def build_message(now: datetime, results: list[tuple[Instrument, Session | None,
                 price = price.rstrip("0").rstrip(".")
             change_label = "24h 涨跌幅"
         change = f"{result.change_pct:+.2f}%" if result.change_pct is not None else "暂无"
-        lines.extend([f"{result.instrument.label}｜{MARKET_NAMES[instrument.market]}", f"现价：{price} {unit}｜{change_label}：{change}"])
+        lines.extend([f"{result.instrument.label}｜{market_name}", f"现价：{price} {unit}｜{change_label}：{change}"])
         if session:
             label = "交易日（纽约）" if instrument.market == "us_share" else "日期" if instrument.market == "crypto" else "交易日"
             lines.append(f"{label}：{session.trading_day}｜{session.name}")
@@ -871,7 +895,8 @@ def build_message(now: datetime, results: list[tuple[Instrument, Session | None,
         lines.append(f"获取时间：{result.fetched_at:%Y-%m-%d %H:%M:%S}｜来源：{result.source}")
         lines.extend(f"提示：{note}" for note in quote_status(result, session, config.stale_minutes))
     lines.extend(f"\n提示：{warning}" for warning in warnings)
-    baseline = "股票、黄金涨跌幅相对前一交易日收盘价"
+    assets = "股票、ETF、黄金" if any(item.is_mainland_etf for item, _, _ in results) else "股票、黄金"
+    baseline = f"{assets}涨跌幅相对前一交易日收盘价"
     if any(item.market == "crypto" for item, _, _ in results):
         baseline += "；加密货币为滚动 24h 涨跌幅"
     lines.append(f"\n{baseline}；免费行情可能延迟，以源端更新为准。")
@@ -998,7 +1023,7 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
     mode = "手动诊断" if manual else ("强制运行" if force else ("配置检查" if check else "按交易时段运行"))
     log(f"[启动] v{VERSION}｜北京时间 {now:%Y-%m-%d %H:%M:%S}｜Python {sys.version.split()[0]}｜{mode}")
     log(f"[调度] 半小时频率由青龙控制，期望定时规则：{EXPECTED_SCHEDULE}；脚本不再限制运行分钟")
-    log("[配置] 关注品种：" + (", ".join(item.symbol for item in config.instruments) or "空") + f"｜A 股来源：{config.stock_source}")
+    log("[配置] 关注品种：" + (", ".join(item.symbol for item in config.instruments) or "空") + f"｜A 股个股来源：{config.stock_source}（国内 ETF 使用腾讯）")
     if manual:
         log("[诊断] 检测到青龙手动运行：检查全部关注品种及通知，休市也检查；不占用定时播报记录")
         log_task_schedule()
@@ -1012,7 +1037,7 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
         try:
             sessions[market] = calendars.session(market, now)
             session = sessions[market]
-            name = MARKET_NAMES[market]
+            name = "A 股及国内 ETF" if market == "a_share" and any(item.is_mainland_etf for item in config.instruments) else MARKET_NAMES[market]
             if session:
                 log(f"[日历] {name}开市：{session.name} {session.start:%m-%d %H:%M}—{session.end:%m-%d %H:%M}，交易日 {session.trading_day}")
             else:
@@ -1070,7 +1095,7 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="按各自交易时段播报黄金、A 股、港股、港股通、美股及加密货币行情")
+    parser = argparse.ArgumentParser(description="按各自交易时段播报黄金、A 股及 ETF、港股、港股通、美股及加密货币行情")
     parser.add_argument("--dry-run", action="store_true", help="只输出消息，不通知、不写入状态")
     parser.add_argument("--force", action="store_true", help="忽略交易时段和已推送状态，用于手动验证")
     parser.add_argument("--check", action="store_true", help="检查配置和交易时段，不获取行情、不通知")
