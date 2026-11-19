@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import builtins
 import contextlib
+import csv
 import importlib
+import io
 import json
 import math
 import os
@@ -22,17 +24,21 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from html.parser import HTMLParser
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 BEIJING = timezone(timedelta(hours=8), "Asia/Shanghai")
 ROOT = Path(__file__).resolve().parent
-VERSION = "2026.11.16.1"
+VERSION = "2026.11.19.1"
 EXPECTED_SCHEDULE = "0,30 * * * *"
+MARKET_NAMES = {"sge": "上金所", "a_share": "A 股", "hk_share": "港股", "hk_connect": "港股通", "us_share": "美股", "crypto": "加密货币现货"}
+HKEX_CALENDAR_URL = "https://www.hkex.com.hk/-/media/HKEX-Market/Mutual-Market/Stock-Connect/Reference-Materials/Trading-Hour,-Trading-and-Settlement-Calendar/{year}-Calendar_csv_e.csv"
 SGE_URL = "https://www.sge.com.cn"
 SSE_CALENDAR_URL = "https://www.sse.com.cn/disclosure/dealinstruc/closed/"
 HTTP_HEADERS = {
@@ -58,6 +64,13 @@ NO_NIGHT_2026 = [
     "2025-12-31", "2026-02-13", "2026-04-03", "2026-04-30",
     "2026-06-18", "2026-09-24", "2026-09-30",
 ]
+
+# 港交所公布的港股及南向港股通日历，两者不能用同一份休市表。
+# 来源为上面的 HKEX 年度 CSV；空白表示正常交易，Half Day 表示半日市。
+HK_CLOSED_2026 = "01-01 02-17 02-18 02-19 04-03 04-06 04-07 05-01 05-25 06-19 07-01 10-01 10-19 12-25".split()
+CONNECT_CLOSED_2026 = "01-01 01-02 02-16 02-17 02-18 02-19 02-20 02-23 04-03 04-06 04-07 05-01 05-04 05-05 05-25 06-19 07-01 09-25 10-01 10-02 10-05 10-06 10-07 10-19 12-25".split()
+HK_HALF_DAYS_2026 = "02-16 12-24 12-31".split()
+CONNECT_HALF_DAYS_2026 = "12-24 12-31".split()
 
 
 class ConfigError(ValueError):
@@ -118,6 +131,8 @@ class Quote:
     quoted_at: datetime | None = None
     change_pct: float | None = None
     notes: list[str] = field(default_factory=list)
+    currency: str = ""
+    price_text: str = ""
 
 
 def log(message: str) -> None:
@@ -171,6 +186,41 @@ def canonical_stock(value: str) -> str:
     return expected + code
 
 
+def canonical_hk(value: str) -> str:
+    value = value.strip().lower()
+    match = re.fullmatch(r"(?:hk)?(\d{1,5})(?:\.hk)?", value)
+    if not match or int(match[1]) == 0:
+        raise ConfigError(f"无效的港股代码：{value}；例如 00700 或 00700.HK")
+    return "hk" + match[1].zfill(5)
+
+
+def canonical_us(value: str) -> str:
+    value = value.strip().upper().replace("-", ".")
+    if not re.fullmatch(r"[A-Z][A-Z0-9]{0,9}(?:\.[A-Z0-9]{1,4})?", value):
+        raise ConfigError(f"无效的美股代码：{value}；例如 AAPL 或 BRK.B")
+    return value
+
+
+def canonical_crypto(value: str) -> str:
+    value = value.strip().upper().replace("-", "/")
+    if "/" not in value:
+        for currency in ("USDT", "USDC", "USD", "BTC", "ETH", "EUR"):
+            if value.endswith(currency) and len(value) > len(currency):
+                value = value[:-len(currency)] + "/" + currency
+                break
+    match = re.fullmatch(r"([A-Z0-9]{1,20})/([A-Z0-9]{1,10})", value)
+    if not match or match[1] == match[2]:
+        raise ConfigError(f"无效的现货交易对：{value}；请填写 BTC/USDT、BTC-USDT 或 BTCUSDT")
+    return value
+
+
+def new_york_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo("America/New_York")
+    except ZoneInfoNotFoundError as exc:
+        raise CalendarError("缺少美国时区数据，请安装新增依赖 exchange-calendars（包含 tzdata）") from exc
+
+
 def load_config(environ: dict | None = None) -> Config:
     env = os.environ if environ is None else environ
     raw, filename = env.get("MARKET_ALERT_CONFIG", ""), env.get("MARKET_ALERT_CONFIG_FILE", "")
@@ -184,12 +234,12 @@ def load_config(environ: dict | None = None) -> Config:
         raise ConfigError(f"无法读取行情配置：{type(exc).__name__}") from exc
     if not isinstance(data, dict):
         raise ConfigError("配置必须是 JSON 对象")
-    allowed = {"gold", "stocks", "stock_source", "timeout_seconds", "stale_minutes", "calendar_overrides"}
+    allowed = {"gold", "stocks", "hk_stocks", "hk_connect", "us_stocks", "crypto", "stock_source", "timeout_seconds", "stale_minutes", "calendar_overrides"}
     unknown = set(data) - allowed
     if unknown:
         raise ConfigError(f"未知配置项：{', '.join(sorted(unknown))}")
     instruments, seen = [], set()
-    for key, market in (("gold", "sge"), ("stocks", "a_share")):
+    for key, market in (("gold", "sge"), ("stocks", "a_share"), ("hk_stocks", "hk_share"), ("hk_connect", "hk_connect"), ("us_stocks", "us_share"), ("crypto", "crypto")):
         entries = data.get(key, [])
         if not isinstance(entries, list):
             raise ConfigError(f"{key} 必须是数组")
@@ -208,8 +258,10 @@ def load_config(environ: dict | None = None) -> Config:
                 if not normalized:
                     raise ConfigError(f"不支持的黄金合约：{symbol}")
             else:
-                normalized = canonical_stock(symbol)
-            identity = (market, normalized)
+                normalizer = {"a_share": canonical_stock, "hk_share": canonical_hk, "hk_connect": canonical_hk, "us_share": canonical_us, "crypto": canonical_crypto}[market]
+                normalized = normalizer(symbol)
+            # 港股通和直接港股使用同一报价，重复配置会导致同条消息出现两遍。
+            identity = ("hk_share" if market == "hk_connect" else market, normalized)
             if identity in seen:
                 raise ConfigError(f"关注品种重复：{normalized}")
             seen.add(identity)
@@ -227,10 +279,12 @@ def load_config(environ: dict | None = None) -> Config:
             raise ConfigError(f"{key} 必须在 {minimum} 到 {maximum} 之间")
         numbers[key] = float(value)
     overrides = data.get("calendar_overrides", {})
-    if not isinstance(overrides, dict) or set(overrides) - {"a_share", "sge"}:
-        raise ConfigError("calendar_overrides 仅支持 a_share 和 sge")
+    if not isinstance(overrides, dict) or set(overrides) - {"a_share", "sge", "hk_share", "hk_connect", "us_share"}:
+        raise ConfigError("calendar_overrides 仅支持 a_share、sge、hk_share、hk_connect 和 us_share")
     for market, rules in overrides.items():
         keys = {"closed_dates", "open_dates"} | ({"no_night_dates"} if market == "sge" else set())
+        if market in {"hk_share", "hk_connect"}:
+            keys.add("half_days")
         if not isinstance(rules, dict) or set(rules) - keys:
             raise ConfigError(f"{market} 日历覆盖配置错误")
         for key, dates in rules.items():
@@ -307,6 +361,33 @@ def parse_annual_calendar(html: str, year: int, market: str) -> dict:
     return {"closed_dates": sorted(d.isoformat() for d in closed), "no_night_dates": sorted(d.isoformat() for d in no_night)}
 
 
+def parse_hk_calendar(text: str, year: int, market: str) -> dict:
+    lines = text.lstrip("\ufeff").splitlines()
+    if not lines or not re.search(rf"Trading Calendar of Stock Connect.*\b{year}\b", lines[0]):
+        raise CalendarError(f"港交所日历标题不匹配 {year} 年")
+    rows = list(csv.DictReader(io.StringIO("\n".join(lines[1:]))))
+    column = "Hong Kong" if market == "hk_share" else "Southbound Trading"
+    observed, closed, half = set(), [], []
+    for row in rows:
+        try:
+            day = date.fromisoformat(row["Date"].strip())
+            status = row[column].strip()
+        except (KeyError, ValueError, AttributeError) as exc:
+            raise CalendarError("港交所年度日历结构不完整") from exc
+        if day.year != year or day.weekday() >= 5 or day in observed or status not in {"", "Holiday", "Closed", "Half Day"}:
+            raise CalendarError("港交所年度日历出现未知状态或重复日期")
+        observed.add(day)
+        if status in {"Holiday", "Closed"}:
+            closed.append(day.isoformat())
+        elif status == "Half Day":
+            half.append(day.isoformat())
+    first = date(year, 1, 1)
+    expected = {first + timedelta(days=i) for i in range((date(year + 1, 1, 1) - first).days) if (first + timedelta(days=i)).weekday() < 5}
+    if observed != expected:
+        raise CalendarError(f"港交所 {year} 年日历未覆盖全年工作日")
+    return {"closed_dates": closed, "half_days": half}
+
+
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
@@ -332,12 +413,17 @@ class CalendarStore:
     def __init__(self, config: Config, state_dir: Path, *, persist: bool = True) -> None:
         self.config, self.state_dir, self.persist = config, state_dir, persist
         self.cache: dict[tuple[str, int], dict] = {}
+        self.us_calendars: dict[int, Any] = {}
 
     def annual(self, market: str, year: int) -> dict:
         key = (market, year)
         if key in self.cache:
             return self.cache[key]
-        if year == 2026:
+        if year == 2026 and market in {"hk_share", "hk_connect"}:
+            closed = HK_CLOSED_2026 if market == "hk_share" else CONNECT_CLOSED_2026
+            half = HK_HALF_DAYS_2026 if market == "hk_share" else CONNECT_HALF_DAYS_2026
+            data = {"closed_dates": [f"2026-{d}" for d in closed], "half_days": [f"2026-{d}" for d in half]}
+        elif year == 2026:
             closed = set().union(*(date_range(date.fromisoformat(a), date.fromisoformat(b)) for a, b in HOLIDAYS_2026))
             data = {"closed_dates": [d.isoformat() for d in closed], "no_night_dates": NO_NIGHT_2026 if market == "sge" else []}
         else:
@@ -350,7 +436,7 @@ class CalendarStore:
                     if self.persist:
                         write_json(cache_path, data)
                 except Exception as exc:
-                    raise CalendarError(f"无法取得 {year} 年{'上金所' if market == 'sge' else 'A 股'}官方日历（{type(exc).__name__}），请更新订阅或检查网络") from exc
+                    raise CalendarError(f"无法取得 {year} 年{MARKET_NAMES[market]}官方日历（{type(exc).__name__}），请更新订阅或检查网络") from exc
         self.cache[key] = data
         return data
 
@@ -363,6 +449,8 @@ class CalendarStore:
             response.encoding = "utf-8"
             return response.text
 
+        if market in {"hk_share", "hk_connect"}:
+            return parse_hk_calendar(get(HKEX_CALENDAR_URL.format(year=year)), year, market)
         if market == "a_share":
             return parse_annual_calendar(get(SSE_CALENDAR_URL), year, market)
         for page in range(1, 7):
@@ -381,7 +469,39 @@ class CalendarStore:
             return True
         if day.weekday() >= 5:
             return False
+        if market == "us_share":
+            return bool(self.us_calendar(day.year).is_session(day.isoformat()))
         return day.isoformat() not in self.annual(market, day.year)["closed_dates"]
+
+    def us_calendar(self, year: int):
+        if year not in self.us_calendars:
+            # is_session 对日历首尾交易日之外会报错；多取前后日期以覆盖元旦休市。
+            try:
+                xcals = importlib.import_module("exchange_calendars")
+                self.us_calendars[year] = xcals.get_calendar("XNYS", start=f"{year - 1}-12-15", end=f"{year + 1}-01-15")
+            except Exception as exc:
+                raise CalendarError(f"无法加载 {year} 年美股日历（{type(exc).__name__}），请安装或更新 exchange-calendars 依赖") from exc
+        return self.us_calendars[year]
+
+    def us_session(self, now: datetime) -> Session | None:
+        zone = new_york_timezone()
+        day = now.astimezone(zone).date()
+        if not self.is_open_day("us_share", day):
+            return None
+        calendar = self.us_calendar(day.year)
+        if calendar.is_session(day.isoformat()):
+            row = calendar.schedule.loc[day.isoformat()]
+            start = row["open"].to_pydatetime().astimezone(BEIJING)
+            end = row["close"].to_pydatetime().astimezone(BEIJING)
+        else:
+            # 显式 open_dates 可用于覆盖临时停复市，时间仍按纽约当地时间。
+            start = datetime.combine(day, time(9, 30), zone).astimezone(BEIJING)
+            end = datetime.combine(day, time(16), zone).astimezone(BEIJING)
+        if start <= now <= end:
+            close = end.astimezone(zone)
+            name = f"常规时段（纽约 {close:%Z}，{close:%H:%M} 收市）"
+            return Session("us_share", day, start, end, name)
+        return None
 
     def night_open(self, day: date) -> bool:
         if not self.is_open_day("sge", day):
@@ -407,6 +527,22 @@ class CalendarStore:
     def session(self, market: str, now: datetime) -> Session | None:
         now = now.astimezone(BEIJING).replace(second=0, microsecond=0)
         day, minute = now.date(), now.hour * 60 + now.minute
+        if market == "crypto":
+            start = datetime.combine(day, time(), BEIJING)
+            return Session(market, day, start, start + timedelta(days=1), "24 小时现货")
+        if market == "us_share":
+            return self.us_session(now)
+        if market in {"hk_share", "hk_connect"}:
+            if not self.is_open_day(market, day):
+                return None
+            half_days = self.annual(market, day.year).get("half_days", []) + self.config.calendar_overrides.get(market, {}).get("half_days", [])
+            half = day.isoformat() in half_days
+            periods = ((570, 720),) if half else ((570, 720), (780, 960))
+            for start, end in periods:
+                if start <= minute <= end:
+                    midnight = datetime.combine(day, time(), BEIJING)
+                    return Session(market, day, midnight + timedelta(minutes=start), midnight + timedelta(minutes=end), "半日市" if half else ("上午" if minute <= 720 else "下午"))
+            return None
         if market == "a_share":
             for start, end in ((570, 690), (780, 900)):
                 if start <= minute <= end and self.is_open_day(market, day):
@@ -430,11 +566,11 @@ def number(value: Any) -> float | None:
         return None
 
 
-def parse_datetime(value: Any) -> datetime:
+def parse_datetime(value: Any, zone=BEIJING) -> datetime:
     text = str(value).strip()
-    for fmt in ("%Y年%m月%d日 %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y%m%d%H%M%S"):
+    for fmt in ("%Y年%m月%d日 %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y%m%d%H%M%S"):
         try:
-            return datetime.strptime(text, fmt).replace(tzinfo=BEIJING)
+            return datetime.strptime(text, fmt).replace(tzinfo=zone).astimezone(BEIJING)
         except ValueError:
             continue
     raise QuoteError("源端未提供可识别的行情日期和时间")
@@ -490,18 +626,76 @@ def gold_quote(instrument: Instrument, records: list[dict], fetched_at: datetime
     return quote
 
 
+def tencent_symbol(instrument: Instrument) -> str:
+    return "us" + instrument.symbol if instrument.market == "us_share" else instrument.symbol
+
+
 def tencent_quote(instrument: Instrument, text: str, fetched_at: datetime) -> Quote:
-    match = re.search(rf'v_{re.escape(instrument.symbol)}="([^"\r\n]*)"', text)
+    symbol = tencent_symbol(instrument)
+    match = re.search(rf'v_{re.escape(symbol)}="([^"\r\n]*)"', text)
     if not match:
-        raise QuoteError("腾讯行情未返回该股票")
+        raise QuoteError("腾讯行情未返回该股票，请检查代码或来源支持范围")
     fields = match[1].split("~")
-    if len(fields) <= 32 or fields[2] != instrument.symbol[2:]:
-        raise QuoteError("股票行情结构或代码不匹配")
+    if len(fields) <= 32:
+        raise QuoteError("股票行情结构不完整")
+    expected = instrument.symbol if instrument.market == "us_share" else instrument.symbol[2:]
+    returned = fields[2]
+    if returned != expected and not (instrument.market == "us_share" and re.fullmatch(re.escape(expected) + r"\.(?:OQ|N|AM|A|PK|OB|O|K)", returned)):
+        raise QuoteError("股票行情代码不匹配")
     price = number(fields[3])
     if price is None or price <= 0:
         raise QuoteError("股票未返回有效成交价，可能尚未成交或已停牌")
+    currency, notes = "CNY", []
+    zone = BEIJING
+    if instrument.market == "us_share":
+        if len(fields) <= 35 or fields[35] != "USD":
+            raise QuoteError("美股来源未提供可识别的美元报价")
+        currency, zone = "USD", new_york_timezone()
+        notes.append("源端纽约时间已换算为北京时间；仅播报常规交易时段")
+    elif instrument.market in {"hk_share", "hk_connect"}:
+        if len(fields) <= 75 or fields[75] not in {"HKD", "CNY", "USD"}:
+            raise QuoteError("港股来源未提供可识别的报价币种")
+        currency = fields[75]
+        if instrument.market == "hk_connect":
+            notes.append("按南向港股通日历播报；价格为港股原币报价，非人民币结算价")
     named = Instrument(instrument.market, instrument.symbol, instrument.name or fields[1])
-    return Quote(named, price, "腾讯免费行情", fetched_at, parse_datetime(fields[30]), number(fields[32]))
+    return Quote(named, price, "腾讯免费行情", fetched_at, parse_datetime(fields[30], zone), number(fields[32]), notes, currency)
+
+
+def crypto_quote(instrument: Instrument, payload: dict, fetched_at: datetime, source: str) -> Quote:
+    if not isinstance(payload, dict):
+        raise QuoteError(f"{source} 行情结构错误")
+    base, currency = instrument.symbol.split("/")
+    if source == "Binance":
+        if payload.get("symbol") != base + currency:
+            raise QuoteError("Binance 未返回对应现货交易对")
+        raw_price = payload.get("lastPrice")
+        price, change = number(raw_price), number(payload.get("priceChangePercent"))
+        stamp = payload.get("closeTime")
+        note = "行情时间为 24 小时统计窗口截止时间"
+    else:
+        rows = payload.get("data", [])
+        if payload.get("code") != "0" or not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("instId") != base + "-" + currency or rows[0].get("instType") != "SPOT":
+            raise QuoteError("OKX 未返回对应现货交易对")
+        row = rows[0]
+        raw_price = row.get("last")
+        price, opening = number(raw_price), number(row.get("open24h"))
+        change = (price / opening - 1) * 100 if price and opening and opening > 0 else None
+        stamp = row.get("ts")
+        note = "行情时间为来源快照生成时间"
+    if price is None or price <= 0:
+        raise QuoteError(f"{source} 未返回有效现货成交价")
+    try:
+        quoted_at = datetime.fromtimestamp(float(stamp) / 1000, timezone.utc).astimezone(BEIJING)
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise QuoteError(f"{source} 未提供有效行情时间") from exc
+    if quoted_at > fetched_at + timedelta(minutes=2):
+        raise QuoteError(f"{source} 行情时间晚于当前时间")
+    # 保留来源的十进制字符串，避免低价币归零或大额价格出现浮点尾数。
+    price_text = str(raw_price)
+    if len(price_text) > 80 or not re.fullmatch(r"\d+(?:\.\d+)?", price_text):
+        raise QuoteError(f"{source} 返回了无法识别的现货价格格式")
+    return Quote(instrument, price, f"{source} 免费现货行情", fetched_at, quoted_at, change, [note], currency, price_text)
 
 
 class QuoteProvider:
@@ -509,6 +703,7 @@ class QuoteProvider:
         self.config, self.calendars, self.state = config, calendars, state
         self.ak = None
         self.primary_failed = False
+        self.crypto_primary_failed = False
 
     def akshare(self):
         if self.ak is None:
@@ -541,12 +736,43 @@ class QuoteProvider:
                 log(f"[取价] AKShare 股票接口不可用：{error_detail(exc)}；本次切换腾讯行情")
         if self.config.stock_source == "akshare":
             raise QuoteError("本次 AKShare 股票接口不可用")
+        return self.tencent(instrument)
+
+    def tencent(self, instrument: Instrument) -> Quote:
         import requests
 
-        response = requests.get(f"https://qt.gtimg.cn/q={instrument.symbol}", headers={**HTTP_HEADERS, "Referer": "https://gu.qq.com/"}, timeout=self.config.timeout_seconds)
+        response = requests.get(f"https://qt.gtimg.cn/q={tencent_symbol(instrument)}", headers={**HTTP_HEADERS, "Referer": "https://gu.qq.com/"}, timeout=self.config.timeout_seconds)
         response.raise_for_status()
         response.encoding = "gb18030"
         return tencent_quote(instrument, response.text, datetime.now(BEIJING))
+
+    def crypto(self, instrument: Instrument) -> Quote:
+        import requests
+
+        errors = []
+        base, currency = instrument.symbol.split("/")
+        sources = [
+            ("Binance", "https://data-api.binance.vision/api/v3/ticker/24hr", {"symbol": base + currency}),
+            ("OKX", "https://www.okx.com/api/v5/market/ticker", {"instId": base + "-" + currency}),
+        ]
+        for source, url, params in sources:
+            if source == "Binance" and self.crypto_primary_failed:
+                continue
+            try:
+                response = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=self.config.timeout_seconds)
+                response.raise_for_status()
+                quote = crypto_quote(instrument, response.json(), datetime.now(BEIJING), source)
+                if source == "OKX":
+                    quote.notes.append("Binance 不可用，本次使用 OKX 同名现货交易对；各交易所价格可能不同")
+                return quote
+            except Exception as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if source == "Binance" and isinstance(exc, requests.RequestException) and (status is None or status in {403, 429, 451} or status >= 500):
+                    self.crypto_primary_failed = True
+                detail = f"{source}：{error_detail(exc)}"
+                errors.append(detail)
+                log(f"[取价] {instrument.symbol} {detail}" + ("；尝试 OKX" if source == "Binance" else ""))
+        raise QuoteError("现货取价失败；" + "；".join(errors))
 
     def gold(self, instrument: Instrument, session: Session | None) -> Quote:
         try:
@@ -591,7 +817,13 @@ class QuoteProvider:
         return quote
 
     def fetch(self, instrument: Instrument, session: Session | None) -> Quote:
-        return self.gold(instrument, session) if instrument.market == "sge" else self.stock(instrument)
+        if instrument.market == "sge":
+            return self.gold(instrument, session)
+        if instrument.market == "a_share":
+            return self.stock(instrument)
+        if instrument.market == "crypto":
+            return self.crypto(instrument)
+        return self.tencent(instrument)
 
 
 def quote_status(quote: Quote, session: Session | None, stale_minutes: float) -> list[str]:
@@ -604,30 +836,45 @@ def quote_status(quote: Quote, session: Session | None, stale_minutes: float) ->
         age = (quote.fetched_at - quote.quoted_at).total_seconds() / 60
         if age > stale_minutes:
             notes.append(f"行情延迟：距报价约 {int(age)} 分钟")
-        if session and quote.quoted_at < session.start:
+        if session and quote.instrument.market != "crypto" and quote.quoted_at < session.start:
             notes.append("当前时段尚无新报价，以上为上一时段价格")
     return notes
 
 
 def build_message(now: datetime, results: list[tuple[Instrument, Session | None, Quote | str]], warnings: list[str], config: Config) -> tuple[str, str]:
-    title = f"黄金与A股行情 {now:%m-%d %H:%M}"
+    title = f"{'多市场行情' if any(item.market not in {'sge', 'a_share'} for item in config.instruments) else '黄金与A股行情'} {now:%m-%d %H:%M}"
     lines = [f"播报时点：{now:%Y-%m-%d %H:%M}（北京时间）"]
     for instrument, session, result in results:
         lines.append("")
         if isinstance(result, str):
             lines.extend([f"{instrument.label}｜获取失败", result])
             continue
-        unit = "元/克" if instrument.market == "sge" else "元/股"
+        currency = result.currency or (instrument.symbol.split("/")[1] if instrument.market == "crypto" else "USD" if instrument.market == "us_share" else "HKD" if instrument.market in {"hk_share", "hk_connect"} else "CNY")
+        currency_name = {"CNY": "元", "HKD": "港元", "USD": "美元"}.get(currency, currency)
+        unit = "元/克" if instrument.market == "sge" else f"{currency_name}/股"
+        price = f"{result.price:,.3f}" if instrument.market in {"hk_share", "hk_connect"} else f"{result.price:,.2f}"
+        change_label = "涨跌幅"
+        if instrument.market == "crypto":
+            unit = f"{currency}/{instrument.symbol.split('/')[0]}"
+            decimal_price = Decimal(result.price_text or str(result.price))
+            price = format(decimal_price, ",f")
+            if "." in price:
+                price = price.rstrip("0").rstrip(".")
+            change_label = "24h 涨跌幅"
         change = f"{result.change_pct:+.2f}%" if result.change_pct is not None else "暂无"
-        lines.extend([f"{result.instrument.label}", f"现价：{result.price:,.2f} {unit}｜涨跌幅：{change}"])
+        lines.extend([f"{result.instrument.label}｜{MARKET_NAMES[instrument.market]}", f"现价：{price} {unit}｜{change_label}：{change}"])
         if session:
-            lines.append(f"交易日：{session.trading_day}｜{session.name}")
+            label = "交易日（纽约）" if instrument.market == "us_share" else "日期" if instrument.market == "crypto" else "交易日"
+            lines.append(f"{label}：{session.trading_day}｜{session.name}")
         if result.quoted_at:
             lines.append(f"行情时间：{result.quoted_at:%Y-%m-%d %H:%M:%S}")
         lines.append(f"获取时间：{result.fetched_at:%Y-%m-%d %H:%M:%S}｜来源：{result.source}")
         lines.extend(f"提示：{note}" for note in quote_status(result, session, config.stale_minutes))
     lines.extend(f"\n提示：{warning}" for warning in warnings)
-    lines.append("\n涨跌幅相对前一交易日收盘价；免费行情以源端更新为准。")
+    baseline = "股票、黄金涨跌幅相对前一交易日收盘价"
+    if any(item.market == "crypto" for item, _, _ in results):
+        baseline += "；加密货币为滚动 24h 涨跌幅"
+    lines.append(f"\n{baseline}；免费行情可能延迟，以源端更新为准。")
     return title, "\n".join(lines)
 
 
@@ -751,7 +998,7 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
     mode = "手动诊断" if manual else ("强制运行" if force else ("配置检查" if check else "按交易时段运行"))
     log(f"[启动] v{VERSION}｜北京时间 {now:%Y-%m-%d %H:%M:%S}｜Python {sys.version.split()[0]}｜{mode}")
     log(f"[调度] 半小时频率由青龙控制，期望定时规则：{EXPECTED_SCHEDULE}；脚本不再限制运行分钟")
-    log("[配置] 关注品种：" + (", ".join(item.symbol for item in config.instruments) or "空") + f"｜股票来源：{config.stock_source}")
+    log("[配置] 关注品种：" + (", ".join(item.symbol for item in config.instruments) or "空") + f"｜A 股来源：{config.stock_source}")
     if manual:
         log("[诊断] 检测到青龙手动运行：检查全部关注品种及通知，休市也检查；不占用定时播报记录")
         log_task_schedule()
@@ -765,7 +1012,7 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
         try:
             sessions[market] = calendars.session(market, now)
             session = sessions[market]
-            name = "上金所" if market == "sge" else "A 股"
+            name = MARKET_NAMES[market]
             if session:
                 log(f"[日历] {name}开市：{session.name} {session.start:%m-%d %H:%M}—{session.end:%m-%d %H:%M}，交易日 {session.trading_day}")
             else:
@@ -823,7 +1070,7 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="按各自交易时段播报黄金与 A 股行情")
+    parser = argparse.ArgumentParser(description="按各自交易时段播报黄金、A 股、港股、港股通、美股及加密货币行情")
     parser.add_argument("--dry-run", action="store_true", help="只输出消息，不通知、不写入状态")
     parser.add_argument("--force", action="store_true", help="忽略交易时段和已推送状态，用于手动验证")
     parser.add_argument("--check", action="store_true", help="检查配置和交易时段，不获取行情、不通知")

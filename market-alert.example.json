@@ -7,11 +7,18 @@
     {"symbol": "sz000001", "name": "平安银行", "enabled": true},
     {"symbol": "bj920002", "name": "万达轴承", "enabled": false}
   ],
+  "hk_stocks": ["00700"],
+  "hk_connect": ["09988"],
+  "us_stocks": ["AAPL", "TSLA", "BRK.B"],
+  "crypto": ["BTC/USDT", "ETH/USDT"],
   "stock_source": "auto",
   "timeout_seconds": 10,
   "stale_minutes": 10,
   "calendar_overrides": {
     "a_share": {"closed_dates": [], "open_dates": []},
-    "sge": {"closed_dates": [], "open_dates": [], "no_night_dates": []}
+    "sge": {"closed_dates": [], "open_dates": [], "no_night_dates": []},
+    "hk_share": {"closed_dates": [], "open_dates": [], "half_days": []},
+    "hk_connect": {"closed_dates": [], "open_dates": [], "half_days": []},
+    "us_share": {"closed_dates": [], "open_dates": []}
   }
 }

@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -60,6 +60,38 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.instruments[0].symbol, "sz000001")
             with self.assertRaises(m.ConfigError):
                 m.load_config({"MARKET_ALERT_CONFIG_FILE": str(path), "MARKET_ALERT_CONFIG": "{}"})
+
+
+class MultiMarketConfigTests(unittest.TestCase):
+    def config(self, value):
+        return m.load_config({"MARKET_ALERT_CONFIG": json.dumps(value)})
+
+    def test_backwards_compatible_lists_and_all_new_symbol_formats(self):
+        config = self.config({"gold": ["Au99.99"], "stocks": ["600519"], "hk_stocks": ["700", "09988.HK"], "hk_connect": ["hk01810"], "us_stocks": ["aapl", "BRK-B"], "crypto": ["BTCUSDT", "ETH-USDT", {"symbol": "SHIB/USDT", "name": "柴犬币"}]})
+        self.assertEqual([(i.market, i.symbol) for i in config.instruments], [("sge", "Au99.99"), ("a_share", "sh600519"), ("hk_share", "hk00700"), ("hk_share", "hk09988"), ("hk_connect", "hk01810"), ("us_share", "AAPL"), ("us_share", "BRK.B"), ("crypto", "BTC/USDT"), ("crypto", "ETH/USDT"), ("crypto", "SHIB/USDT")])
+        self.assertEqual(config.instruments[-1].name, "柴犬币")
+
+    def test_rejects_ambiguous_or_duplicate_new_symbols(self):
+        cases = [
+            {"hk_stocks": [700]}, {"hk_stocks": ["00000"]}, {"hk_stocks": ["600519"]},
+            {"hk_stocks": ["700", "00700.HK"]}, {"hk_stocks": ["700"], "hk_connect": ["00700"]},
+            {"us_stocks": ["BRK-B", "BRK.B"]}, {"us_stocks": ["US:AAPL"]},
+            {"us_stocks": ["AAPL&other=value"]}, {"crypto": ["BTC"]},
+            {"crypto": ["BTC/USDT/SWAP"]}, {"crypto": ["BTC/BTC"]},
+            {"crypto": ["BTCUSDT", "BTC-USDT"]},
+            {"calendar_overrides": {"crypto": {"closed_dates": []}}},
+            {"calendar_overrides": {"hk_share": {"half_days": ["2026-02-30"]}}},
+        ]
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(m.ConfigError):
+                self.config(value)
+
+    def test_new_markets_can_be_disabled_and_override_calendars(self):
+        config = self.config({"hk_stocks": [{"symbol": "00700", "enabled": False}], "us_stocks": ["AAPL"], "calendar_overrides": {"us_share": {"closed_dates": ["2026-11-16"]}, "hk_connect": {"half_days": ["2026-11-16"]}}})
+        self.assertEqual(config.instruments, [m.Instrument("us_share", "AAPL")])
+        calendar = m.CalendarStore(config, Path("unused"), persist=False)
+        self.assertIsNone(calendar.session("us_share", at("2026-11-16T22:30:00")))
+        self.assertIsNone(calendar.session("hk_connect", at("2026-11-16T13:30:00")))
 
 
 class CalendarTests(unittest.TestCase):
@@ -120,6 +152,118 @@ class CalendarTests(unittest.TestCase):
             count = sum(self.calendar.session(market, instant) is not None for instant in instants)
             # 周一白天14次黄金、10次股票，另有周一20:00之后8次夜盘。
             self.assertEqual(count, expected + (8 if market == "sge" else 0))
+
+
+class GlobalCalendarTests(unittest.TestCase):
+    def setUp(self):
+        self.calendar = m.CalendarStore(m.Config([]), Path("unused"), persist=False)
+
+    def test_hk_lunch_open_and_close_boundaries(self):
+        for market in ("hk_share", "hk_connect"):
+            for clock, opened in (("09:00", False), ("09:30", True), ("12:00", True), ("12:30", False), ("13:00", True), ("16:00", True), ("16:30", False)):
+                with self.subTest(market=market, clock=clock):
+                    self.assertEqual(bool(self.calendar.session(market, at(f"2026-11-16T{clock}:00"))), opened)
+
+    def test_hk_and_southbound_have_different_holidays(self):
+        for day in ("2026-01-02", "2026-02-20", "2026-09-25", "2026-10-07"):
+            with self.subTest(day=day):
+                self.assertIsNotNone(self.calendar.session("hk_share", at(day + "T10:00:00")))
+                self.assertIsNone(self.calendar.session("hk_connect", at(day + "T10:00:00")))
+        for market in ("hk_share", "hk_connect"):
+            for day in ("2026-04-07", "2026-10-19", "2026-12-25", "2026-11-15"):
+                with self.subTest(market=market, day=day):
+                    self.assertIsNone(self.calendar.session(market, at(day + "T10:00:00")))
+
+    def test_hk_half_day_schedules_and_connect_lunar_new_year_closure(self):
+        self.assertEqual(self.calendar.session("hk_share", at("2026-02-16T12:00:00")).name, "半日市")
+        self.assertIsNone(self.calendar.session("hk_connect", at("2026-02-16T10:00:00")))
+        for market in ("hk_share", "hk_connect"):
+            for day in ("2026-12-24", "2026-12-31"):
+                with self.subTest(market=market, day=day):
+                    self.assertIsNotNone(self.calendar.session(market, at(day + "T12:00:00")))
+                    self.assertIsNone(self.calendar.session(market, at(day + "T12:30:00")))
+                    self.assertIsNone(self.calendar.session(market, at(day + "T13:00:00")))
+
+    def test_us_dst_and_cross_midnight_use_new_york_trading_day(self):
+        for day, opening, closing in (("2026-07-13", "21:30", "04:00"), ("2026-11-16", "22:30", "05:00")):
+            start = at(day + "T" + opening + ":00")
+            end = at((start.date() + timedelta(days=1)).isoformat() + "T" + closing + ":00")
+            with self.subTest(day=day):
+                self.assertIsNone(self.calendar.session("us_share", start - timedelta(minutes=30)))
+                session = self.calendar.session("us_share", start)
+                self.assertEqual(session.end, end)
+                self.assertEqual(session.trading_day, start.date())
+                self.assertEqual(self.calendar.session("us_share", end), session)
+                self.assertIsNone(self.calendar.session("us_share", end + timedelta(minutes=30)))
+        self.assertIsNotNone(self.calendar.session("us_share", at("2026-11-14T04:30:00")))
+        self.assertIsNone(self.calendar.session("us_share", at("2026-11-16T04:30:00")))
+
+    def test_us_dst_transition_weekdays(self):
+        for day, clock, opened in (("2026-03-06", "21:30", False), ("2026-03-09", "21:30", True), ("2026-10-30", "21:30", True), ("2026-11-02", "21:30", False), ("2026-11-02", "22:30", True)):
+            with self.subTest(day=day, clock=clock):
+                self.assertEqual(bool(self.calendar.session("us_share", at(day + "T" + clock + ":00"))), opened)
+
+    def test_us_holidays_and_early_closes(self):
+        self.assertIsNone(self.calendar.session("us_share", at("2026-07-03T21:30:00")))
+        self.assertIsNone(self.calendar.session("us_share", at("2026-11-26T22:30:00")))
+        self.assertIsNotNone(self.calendar.session("us_share", at("2026-11-28T02:00:00")))
+        self.assertIsNone(self.calendar.session("us_share", at("2026-11-28T02:30:00")))
+        self.assertIsNone(self.calendar.session("us_share", at("2026-12-25T02:30:00")))
+
+    def test_us_new_year_boundaries_and_previous_year_trading_date(self):
+        self.assertIsNone(self.calendar.session("us_share", at("2026-01-01T22:30:00")))
+        self.assertIsNone(self.calendar.session("us_share", at("2026-01-02T00:30:00")))
+        self.assertIsNone(self.calendar.session("us_share", at("2027-01-01T22:30:00")))
+        session = self.calendar.session("us_share", at("2027-01-01T02:00:00"))
+        self.assertEqual(session.trading_day, date(2026, 12, 31))
+        self.assertEqual(session.end, at("2027-01-01T05:00:00"))
+
+    def test_crypto_remains_open_on_weekends_and_holidays(self):
+        for instant in ("2026-11-15T00:00:00", "2026-10-01T23:30:00", "2027-01-01T05:00:00"):
+            with self.subTest(instant=instant), patch.object(self.calendar, "annual", side_effect=AssertionError("no stock calendar")):
+                session = self.calendar.session("crypto", at(instant))
+                self.assertEqual(session.name, "24 小时现货")
+                self.assertEqual(session.trading_day, at(instant).date())
+
+    def test_missing_us_dependency_never_falls_back_to_weekdays(self):
+        real_import = m.importlib.import_module
+        def missing(name):
+            if name == "exchange_calendars":
+                raise ModuleNotFoundError(name)
+            return real_import(name)
+        with patch.object(m.importlib, "import_module", side_effect=missing), self.assertRaises(m.CalendarError):
+            self.calendar.session("us_share", at("2026-11-16T22:30:00"))
+
+    def test_future_hk_calendar_fetch_cache_and_unknown_year_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calendar = m.CalendarStore(m.Config([]), Path(directory))
+            data = {"closed_dates": ["2027-01-01"], "half_days": ["2027-12-24"]}
+            with patch.object(calendar, "fetch_annual", return_value=data) as fetch:
+                self.assertEqual(calendar.session("hk_share", at("2027-12-24T12:00:00")).name, "半日市")
+                fetch.assert_called_once_with("hk_share", 2027)
+            other = m.CalendarStore(m.Config([]), Path(directory))
+            with patch.object(other, "fetch_annual", side_effect=AssertionError("cached")):
+                self.assertIsNone(other.session("hk_share", at("2027-12-24T13:00:00")))
+            with patch.object(other, "fetch_annual", side_effect=OSError("not announced")), self.assertRaises(m.CalendarError):
+                other.session("hk_connect", at("2027-11-16T10:00:00"))
+
+    def test_full_hk_csv_parsing_rejects_partial_or_unknown_status(self):
+        import csv
+        text = io.StringIO()
+        text.write("Trading Calendar of Stock Connect (Jan 2027 - Dec 2027)\n")
+        writer = csv.writer(text)
+        writer.writerow(["Date", "Hong Kong", "Southbound Trading"])
+        day = date(2027, 1, 1)
+        while day.year == 2027:
+            if day.weekday() < 5:
+                writer.writerow([day.isoformat(), "Half Day" if day.isoformat() == "2027-12-24" else "Holiday" if day.isoformat() == "2027-01-01" else "", "Closed" if day.isoformat() == "2027-01-01" else ""])
+            day += timedelta(days=1)
+        valid = text.getvalue()
+        self.assertEqual(m.parse_hk_calendar(valid, 2027, "hk_share"), {"closed_dates": ["2027-01-01"], "half_days": ["2027-12-24"]})
+        self.assertEqual(m.parse_hk_calendar(valid, 2027, "hk_connect")["half_days"], [])
+        for broken in (valid.replace("2027-01-04,,", "2027-01-04,Unknown,"), "\n".join(valid.splitlines()[:-1]), valid.replace("2027-01-04", "2027-01-05"), valid.replace("2027", "2028")):
+            with self.subTest(broken=broken[:60]), self.assertRaises(m.CalendarError):
+                m.parse_hk_calendar(broken, 2027, "hk_share")
 
 
 class CalendarParsingTests(unittest.TestCase):
@@ -278,6 +422,150 @@ class QuoteTests(unittest.TestCase):
         self.assertEqual(quote.price, 840)
         self.assertEqual(quote.source, "上金所公开行情")
         self.assertEqual(request.call_args.kwargs["data"], {"instid": "Au99.99"})
+
+
+class GlobalQuoteTests(unittest.TestCase):
+    def tencent(self, instrument, code, stamp, currency, price="348.400"):
+        fields = [""] * 78
+        fields[1], fields[2], fields[3], fields[30], fields[32] = "测试股票", code, price, stamp, "1.25"
+        fields[35 if instrument.market == "us_share" else 75] = currency
+        return 'v_' + m.tencent_symbol(instrument) + '="' + "~".join(fields) + '";'
+
+    def test_hk_quote_currency_preserves_rmb_counters_and_connect_market(self):
+        for market, symbol, currency in (("hk_share", "hk00700", "HKD"), ("hk_share", "hk80700", "CNY"), ("hk_connect", "hk09988", "HKD")):
+            instrument = m.Instrument(market, symbol)
+            quote = m.tencent_quote(instrument, self.tencent(instrument, symbol[2:], "2026/11/16 10:30:00", currency), at("2026-11-16T10:30:05"))
+            self.assertEqual(quote.currency, currency)
+            self.assertEqual(quote.quoted_at, at("2026-11-16T10:30:00"))
+            self.assertEqual(quote.instrument.market, market)
+            _, content = m.build_message(quote.fetched_at, [(instrument, None, quote)], [], m.Config([instrument]))
+            self.assertIn("港元/股" if currency == "HKD" else "元/股", content)
+            if market == "hk_connect":
+                self.assertIn("非人民币结算价", content)
+
+    def test_us_quote_timestamp_and_class_symbols(self):
+        instrument = m.Instrument("us_share", "BRK.B")
+        for day, local, expected in (("2026-07-13", "16:00:00", "2026-07-14T04:00:00"), ("2026-11-16", "16:00:01", "2026-11-17T05:00:01")):
+            with self.subTest(day=day):
+                text = self.tencent(instrument, "BRK.B.N", day + " " + local, "USD")
+                quote = m.tencent_quote(instrument, text, at(expected) + timedelta(seconds=5))
+                self.assertEqual(quote.quoted_at, at(expected))
+                self.assertEqual(quote.currency, "USD")
+        for code, currency in (("BRK.A.N", "USD"), ("BRK.B.N", "HKD")):
+            with self.subTest(code=code, currency=currency), self.assertRaises(m.QuoteError):
+                m.tencent_quote(instrument, self.tencent(instrument, code, "2026-11-16 16:00:00", currency), at("2026-11-17T05:00:05"))
+
+    def test_us_etf_quotes_accept_amex_suffix_without_changing_symbol(self):
+        instrument = m.Instrument("us_share", "SPY")
+        text = self.tencent(instrument, "SPY.AM", "2026-11-16 16:00:01", "USD", "730.20")
+        quote = m.tencent_quote(instrument, text, at("2026-11-17T05:00:05"))
+        self.assertEqual(quote.price, 730.2)
+        self.assertEqual(quote.instrument.symbol, "SPY")
+
+    def test_foreign_quotes_do_not_download_entire_akshare_stock_universe(self):
+        instrument = m.Instrument("us_share", "AAPL")
+        response = Mock(text=self.tencent(instrument, "AAPL.OQ", "2026-11-16 10:00:00", "USD"))
+        provider = m.QuoteProvider(m.Config([instrument], stock_source="akshare"), None, {})
+        with patch.object(provider, "akshare", side_effect=AssertionError("no full universe scan")), patch("requests.get", return_value=response) as get:
+            self.assertEqual(provider.fetch(instrument, None).currency, "USD")
+        self.assertEqual(get.call_args.args[0], "https://qt.gtimg.cn/q=usAAPL")
+
+    def test_crypto_units_low_prices_and_rolling_change(self):
+        instant = at("2026-11-16T10:30:00")
+        cases = [("BTC/USDT", "63714.42000000", "63,714.42", "USDT/BTC"), ("SHIB/USDT", "0.00000390", "0.0000039", "USDT/SHIB"), ("ETH/BTC", "0.02834000", "0.02834", "BTC/ETH")]
+        for symbol, raw, expected, unit in cases:
+            with self.subTest(symbol=symbol):
+                item = m.Instrument("crypto", symbol)
+                payload = {"symbol": symbol.replace("/", ""), "lastPrice": raw, "priceChangePercent": "-1.25", "closeTime": int(instant.timestamp() * 1000)}
+                quote = m.crypto_quote(item, payload, instant, "Binance")
+                title, content = m.build_message(instant, [(item, None, quote)], [], m.Config([item]))
+                self.assertIn("多市场行情", title)
+                self.assertIn("现价：" + expected + " " + unit, content)
+                self.assertIn("24h 涨跌幅：-1.25%", content)
+                self.assertNotIn("美元", content)
+                self.assertEqual(quote.quoted_at, instant)
+
+    def test_crypto_midnight_does_not_create_a_false_previous_session_warning(self):
+        item = m.Instrument("crypto", "BTC/USDT")
+        now = at("2026-11-17T00:00:00")
+        session = m.CalendarStore(m.Config([item]), Path("unused")).session("crypto", now)
+        quote = m.Quote(item, 63000, "test", now, now - timedelta(seconds=2))
+        self.assertNotIn("上一时段", " ".join(m.quote_status(quote, session, 10)))
+
+    def test_okx_timestamp_and_change_are_24h_and_spot_only(self):
+        instant = at("2026-11-16T10:30:00")
+        item = m.Instrument("crypto", "BTC/USDT")
+        row = {"instId": "BTC-USDT", "instType": "SPOT", "last": "105.00", "open24h": "100", "ts": str(int(instant.timestamp()*1000))}
+        quote = m.crypto_quote(item, {"code": "0", "data": [row]}, instant, "OKX")
+        self.assertAlmostEqual(quote.change_pct, 5)
+        self.assertEqual(quote.quoted_at, instant)
+        for update in ({"instType": "SWAP"}, {"instId": "ETH-USDT"}, {"last": "0"}, {"ts": "bad"}, {"ts": str(int((instant + timedelta(days=1)).timestamp()*1000))}):
+            with self.subTest(update=update), self.assertRaises(m.QuoteError):
+                m.crypto_quote(item, {"code": "0", "data": [{**row, **update}]}, instant, "OKX")
+
+    def test_crypto_invalid_or_wrong_symbols_never_become_valid_prices(self):
+        item = m.Instrument("crypto", "BTC/USDT")
+        instant = at("2026-11-16T10:30:00")
+        valid = {"symbol": "BTCUSDT", "lastPrice": "63000", "priceChangePercent": "0", "closeTime": int(instant.timestamp()*1000)}
+        for update in ({"symbol": "ETHUSDT"}, {"lastPrice": "NaN"}, {"lastPrice": "0"}, {"lastPrice": "-1"}, {"closeTime": None}):
+            with self.subTest(update=update), self.assertRaises(m.QuoteError):
+                m.crypto_quote(item, {**valid, **update}, instant, "Binance")
+        for payload in ([], {"code": "-1", "data": []}, {"code": "0", "data": [{}]}):
+            with self.subTest(payload=payload), self.assertRaises(m.QuoteError):
+                m.crypto_quote(item, payload, instant, "OKX")
+
+    def test_crypto_network_failure_switches_remaining_quotes_to_okx(self):
+        import requests
+        items = [m.Instrument("crypto", symbol) for symbol in ("BTC/USDT", "ETH/USDT")]
+        provider = m.QuoteProvider(m.Config(items), None, {})
+        def response(url, **kwargs):
+            if "binance" in url:
+                raise requests.ConnectionError("unavailable")
+            item = kwargs["params"]["instId"]
+            return Mock(json=Mock(return_value={"code": "0", "data": [{"instId": item, "instType": "SPOT", "last": "105", "open24h": "100", "ts": str(int(datetime.now(m.BEIJING).timestamp()*1000))}]}))
+        with patch("requests.get", side_effect=response) as get:
+            for item in items:
+                quote = provider.fetch(item, None)
+                self.assertIn("OKX", quote.source)
+                self.assertIn("各交易所价格可能不同", " ".join(quote.notes))
+        self.assertEqual(sum("binance" in call.args[0] for call in get.call_args_list), 1)
+
+    def test_missing_crypto_pair_does_not_disable_binance_for_other_pairs(self):
+        import requests
+        provider = m.QuoteProvider(m.Config([]), None, {})
+        bad = Mock(status_code=400, url="https://data-api.binance.vision/api/v3/ticker/24hr")
+        failure = requests.HTTPError(response=bad)
+        with patch("requests.get", side_effect=failure), self.assertRaises(m.QuoteError):
+            provider.crypto(m.Instrument("crypto", "NOTLISTED/USDT"))
+        self.assertFalse(provider.crypto_primary_failed)
+
+
+class GlobalExecutionTests(unittest.TestCase):
+    def test_combined_push_selects_each_market_independently(self):
+        config = m.load_config({"MARKET_ALERT_CONFIG": json.dumps({"gold": ["Au99.99"], "stocks": ["600519"], "hk_stocks": ["00700"], "hk_connect": ["09988"], "us_stocks": ["AAPL"], "crypto": ["BTCUSDT"]})})
+        for instant, expected in (("2026-11-16T10:30:00", {"sge", "a_share", "hk_share", "hk_connect", "crypto"}), ("2026-11-16T12:30:00", {"sge", "crypto"}), ("2026-11-17T03:30:00", {"us_share", "crypto"}), ("2026-11-15T10:00:00", {"crypto"})):
+            with self.subTest(instant=instant), tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+                fetched = []
+                def fetch(item, session):
+                    fetched.append(item.market)
+                    return m.Quote(item, 100, "test", at(instant), at(instant))
+                notify = Mock()
+                result = m.run(config, at(instant), Path(directory), provider_factory=lambda *args: SimpleNamespace(fetch=fetch), notify=notify)
+                self.assertEqual(result, 0)
+                self.assertEqual(set(fetched), expected)
+                notify.assert_called_once()
+                self.assertIn("多市场行情", notify.call_args.args[0])
+
+    def test_missing_us_calendar_does_not_stop_24h_crypto(self):
+        config = m.Config([m.Instrument("us_share", "AAPL"), m.Instrument("crypto", "BTC/USDT")])
+        with tempfile.TemporaryDirectory() as directory, patch.object(m.CalendarStore, "us_calendar", side_effect=m.CalendarError("请安装 exchange-calendars")), contextlib.redirect_stdout(io.StringIO()):
+            fetch = Mock(side_effect=lambda item, session: m.Quote(item, 100, "test", at("2026-11-16T22:30:00")))
+            notify = Mock()
+            code = m.run(config, at("2026-11-16T22:30:00"), Path(directory), provider_factory=lambda *args: SimpleNamespace(fetch=fetch), notify=notify)
+        self.assertEqual(code, 1)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(fetch.call_args.args[0].market, "crypto")
+        self.assertIn("请安装 exchange-calendars", notify.call_args.args[1])
 
 
 class ExecutionTests(unittest.TestCase):
