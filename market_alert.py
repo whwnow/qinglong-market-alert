@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 BEIJING = timezone(timedelta(hours=8), "Asia/Shanghai")
 ROOT = Path(__file__).resolve().parent
-VERSION = "2026.11.19.2"
+VERSION = "2026.11.19.3"
 EXPECTED_SCHEDULE = "0,30 * * * *"
 MARKET_NAMES = {"sge": "上金所", "a_share": "A 股", "hk_share": "港股", "hk_connect": "港股通", "us_share": "美股", "crypto": "加密货币现货"}
 HKEX_CALENDAR_URL = "https://www.hkex.com.hk/-/media/HKEX-Market/Mutual-Market/Stock-Connect/Reference-Materials/Trading-Hour,-Trading-and-Settlement-Calendar/{year}-Calendar_csv_e.csv"
@@ -143,6 +143,7 @@ class Quote:
     notes: list[str] = field(default_factory=list)
     currency: str = ""
     price_text: str = ""
+    fallback_source: str = ""
 
 
 def log(message: str) -> None:
@@ -780,6 +781,7 @@ class QuoteProvider:
                 response.raise_for_status()
                 quote = crypto_quote(instrument, response.json(), datetime.now(BEIJING), source)
                 if source == "OKX":
+                    quote.fallback_source = source
                     quote.notes.append("Binance 不可用，本次使用 OKX 同名现货交易对；各交易所价格可能不同")
                 return quote
             except Exception as exc:
@@ -843,63 +845,56 @@ class QuoteProvider:
         return self.tencent(instrument)
 
 
-def quote_status(quote: Quote, session: Session | None, stale_minutes: float) -> list[str]:
-    notes = list(quote.notes)
+def quote_status(quote: Quote, session: Session | None, stale_minutes: float, *, market_closed: bool = False) -> str:
+    if quote.quoted_at is not None and quote.quoted_at > quote.fetched_at + timedelta(minutes=2):
+        return "报价时间异常"
+    if market_closed:
+        return "港股通休市" if quote.instrument.market == "hk_connect" else "休市"
     if quote.quoted_at is None:
-        notes.append("源端未提供行情时间，无法核实延迟")
-    elif quote.quoted_at > quote.fetched_at + timedelta(minutes=2):
-        notes.append("源端行情时间异常：晚于当前时间")
-    else:
-        age = (quote.fetched_at - quote.quoted_at).total_seconds() / 60
-        if age > stale_minutes:
-            notes.append(f"行情延迟：距报价约 {int(age)} 分钟")
-        if session and quote.instrument.market != "crypto" and quote.quoted_at < session.start:
-            notes.append("当前时段尚无新报价，以上为上一时段价格")
-    return notes
+        return "报价时间未知"
+    if session and quote.instrument.market != "crypto" and quote.quoted_at < session.start:
+        return "旧报价"
+    age = (quote.fetched_at - quote.quoted_at).total_seconds() / 60
+    return f"延迟约 {int(age)} 分钟" if age > stale_minutes else ""
 
 
-def build_message(now: datetime, results: list[tuple[Instrument, Session | None, Quote | str]], warnings: list[str], config: Config) -> tuple[str, str]:
+def build_message(now: datetime, results: list[tuple[Instrument, Session | None, Quote | str]], warnings: list[str], config: Config, *, closed_markets: set[str] | None = None) -> tuple[str, str]:
     topic = "多市场行情" if any(item.market not in {"sge", "a_share"} for item in config.instruments) else (
         "黄金与A股/ETF行情" if any(item.is_mainland_etf for item in config.instruments) else "黄金与A股行情"
     )
     title = f"{topic} {now:%m-%d %H:%M}"
-    lines = [f"播报时点：{now:%Y-%m-%d %H:%M}（北京时间）"]
+    closed_markets = closed_markets or set()
+    lines = []
     for instrument, session, result in results:
-        lines.append("")
         if isinstance(result, str):
-            lines.extend([f"{instrument.label}｜获取失败", result])
+            label = " ".join(instrument.label.split())
+            lines.append(f"{label}｜获取失败：{' '.join(result.split())}")
             continue
         currency = result.currency or (instrument.symbol.split("/")[1] if instrument.market == "crypto" else "USD" if instrument.market == "us_share" else "HKD" if instrument.market in {"hk_share", "hk_connect"} else "CNY")
         currency_name = {"CNY": "元", "HKD": "港元", "USD": "美元"}.get(currency, currency)
         unit = "元/克" if instrument.market == "sge" else f"{currency_name}/股"
         price = f"{result.price:,.3f}" if instrument.is_mainland_etf or instrument.market in {"hk_share", "hk_connect"} else f"{result.price:,.2f}"
-        market_name = MARKET_NAMES[instrument.market]
         if instrument.is_mainland_etf:
             unit = "元/份"
-            market_name = "沪市 ETF" if instrument.symbol.startswith("sh") else "深市 ETF"
-        change_label = "涨跌幅"
+        change = f"{result.change_pct:+.2f}%" if result.change_pct is not None else "涨跌幅暂无"
         if instrument.market == "crypto":
-            unit = f"{currency}/{instrument.symbol.split('/')[0]}"
+            unit = currency
             decimal_price = Decimal(result.price_text or str(result.price))
             price = format(decimal_price, ",f")
             if "." in price:
                 price = price.rstrip("0").rstrip(".")
-            change_label = "24h 涨跌幅"
-        change = f"{result.change_pct:+.2f}%" if result.change_pct is not None else "暂无"
-        lines.extend([f"{result.instrument.label}｜{market_name}", f"现价：{price} {unit}｜{change_label}：{change}"])
-        if session:
-            label = "交易日（纽约）" if instrument.market == "us_share" else "日期" if instrument.market == "crypto" else "交易日"
-            lines.append(f"{label}：{session.trading_day}｜{session.name}")
-        if result.quoted_at:
-            lines.append(f"行情时间：{result.quoted_at:%Y-%m-%d %H:%M:%S}")
-        lines.append(f"获取时间：{result.fetched_at:%Y-%m-%d %H:%M:%S}｜来源：{result.source}")
-        lines.extend(f"提示：{note}" for note in quote_status(result, session, config.stale_minutes))
-    lines.extend(f"\n提示：{warning}" for warning in warnings)
-    assets = "股票、ETF、黄金" if any(item.is_mainland_etf for item, _, _ in results) else "股票、黄金"
-    baseline = f"{assets}涨跌幅相对前一交易日收盘价"
-    if any(item.market == "crypto" for item, _, _ in results):
-        baseline += "；加密货币为滚动 24h 涨跌幅"
-    lines.append(f"\n{baseline}；免费行情可能延迟，以源端更新为准。")
+            change = f"24h {change}"
+        status = quote_status(result, session, config.stale_minutes, market_closed=instrument.market in closed_markets)
+        tags = [status] if status else []
+        if result.fallback_source:
+            tags.append(f"备用源 {result.fallback_source}")
+        suffix = f"（{' · '.join(tags)}）" if tags else ""
+        label = " ".join(result.instrument.label.split())
+        lines.append(f"{label}｜{price} {unit}｜{change}{suffix}")
+    if warnings:
+        if lines:
+            lines.append("")
+        lines.extend(f"日历异常｜{warning}" for warning in warnings)
     return title, "\n".join(lines)
 
 
@@ -1033,6 +1028,7 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
     calendars = CalendarStore(config, state_dir, persist=not dry_run and not check)
     active, warnings = [], []
     sessions = {}
+    closed_markets = set()
     for market in dict.fromkeys(item.market for item in config.instruments):
         try:
             sessions[market] = calendars.session(market, now)
@@ -1041,6 +1037,7 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
             if session:
                 log(f"[日历] {name}开市：{session.name} {session.start:%m-%d %H:%M}—{session.end:%m-%d %H:%M}，交易日 {session.trading_day}")
             else:
+                closed_markets.add(market)
                 log(f"[日历] {name}当前休市")
         except CalendarError as exc:
             warnings.append(str(exc))
@@ -1070,15 +1067,18 @@ def run(config: Config, now: datetime, state_dir: Path, *, dry_run: bool = False
             log(f"[取价] 开始获取 {item.label}")
             try:
                 result = provider.fetch(item, session)
-                if diagnostic and session is None:
-                    result.notes.append("手动检查时该市场休市，以上为来源最后可用报价")
-                log(f"[取价] {item.symbol} 成功｜来源：{result.source}｜耗时 {perf_counter() - started:.1f} 秒")
+                quote_time = result.quoted_at.strftime("%Y-%m-%d %H:%M:%S") if result.quoted_at else "未提供"
+                log(f"[取价] {item.symbol} 成功｜来源：{result.source}｜耗时 {perf_counter() - started:.1f} 秒｜行情时间：{quote_time}｜获取时间：{result.fetched_at:%Y-%m-%d %H:%M:%S}")
+                status = quote_status(result, session, config.stale_minutes, market_closed=item.market in closed_markets)
+                notes = [*result.notes, status] if status else result.notes
+                if notes:
+                    log(f"[取价] {item.symbol} 提示：{'；'.join(notes)}")
             except Exception as exc:
                 failures += 1
                 result = error_detail(exc)
                 log(f"[取价] {item.symbol} 失败｜{result}｜耗时 {perf_counter() - started:.1f} 秒")
             results.append((item, session, result))
-        title, content = build_message(now, results, warnings, config)
+        title, content = build_message(now, results, warnings, config, closed_markets=closed_markets)
         if manual:
             title = "手动检查｜" + title
         log(f"{title}\n\n{content}")

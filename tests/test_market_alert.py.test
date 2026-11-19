@@ -119,11 +119,9 @@ class MainlandETFTests(unittest.TestCase):
         self.assertEqual((quote.price, quote.change_pct, quote.currency), (4.063, 0.12, "CNY"))
         title, content = m.build_message(now, [(etf, None, quote), (stock, None, m.Quote(stock, 1460.21, "test", now))], [], m.Config([etf, stock]))
         self.assertIn("ETF", title)
-        self.assertIn("我的沪深300 (sh510300)｜沪市 ETF", content)
-        self.assertIn("现价：4.063 元/份｜涨跌幅：+0.12%", content)
-        self.assertIn("现价：1,460.21 元/股", content)
-        self.assertIn("非基金净值或 IOPV 估值", content)
-        self.assertIn("前一交易日收盘价", content)
+        self.assertIn("我的沪深300 (sh510300)｜4.063 元/份｜+0.12%", content)
+        self.assertIn("sh600519｜1,460.21 元/股", content)
+        self.assertNotIn("IOPV", content)
         # 保留低价 ETF 的最小报价单位，不因两位小数格式显示为零。
         quote.price = 0.001
         _, tiny = m.build_message(now, [(etf, None, quote)], [], m.Config([etf]))
@@ -151,8 +149,7 @@ class MainlandETFTests(unittest.TestCase):
                 self.assertEqual(notify.call_count, int(expected_calls > 0))
                 if expected_calls:
                     self.assertEqual({call.args[1].market for call in fetch.call_args_list}, {"a_share"})
-                    self.assertIn("深市 ETF", notify.call_args.args[1])
-                    self.assertIn("元/份", notify.call_args.args[1])
+                    self.assertIn("sz159915｜4.063 元/份", notify.call_args.args[1])
 
     def test_etf_failure_does_not_drop_other_quotes_and_manual_diagnosis_still_works(self):
         config = self.config(["510300", "159915"])
@@ -474,15 +471,22 @@ class QuoteTests(unittest.TestCase):
         self.assertEqual(quote.instrument.name, "平安银行")
         self.assertEqual(quote.quoted_at, at("2026-11-16T10:30:00"))
 
-    def test_stale_prior_session_and_unknown_timestamp_are_visible(self):
+    def test_compact_quote_status_prioritizes_closure_and_previous_session_over_age(self):
         calendar = m.CalendarStore(m.Config([]), Path("unused"))
         session = calendar.session("a_share", at("2026-11-16T13:00:00"))
-        quote = m.Quote(self.stock, 12, "test", at("2026-11-16T13:00:00"), at("2026-11-16T11:30:00"))
-        status = " ".join(m.quote_status(quote, session, 10))
-        self.assertIn("行情延迟", status)
-        self.assertIn("上一时段价格", status)
-        quote.quoted_at = None
-        self.assertIn("无法核实延迟", " ".join(m.quote_status(quote, session, 10)))
+        now = at("2026-11-16T13:30:00")
+        cases = [
+            (at("2026-11-16T11:30:00"), session, False, "旧报价"),
+            (at("2026-11-16T11:30:00"), None, True, "休市"),
+            (at("2026-11-16T13:15:00"), session, False, "延迟约 15 分钟"),
+            (at("2026-11-16T13:20:00"), session, False, ""),
+            (None, session, False, "报价时间未知"),
+            (at("2026-11-17T13:00:00"), None, True, "报价时间异常"),
+        ]
+        for quoted_at, current_session, market_closed, expected in cases:
+            with self.subTest(quoted_at=quoted_at, market_closed=market_closed):
+                quote = m.Quote(self.stock, 12, "test", now, quoted_at)
+                self.assertEqual(m.quote_status(quote, current_session, 10, market_closed=market_closed), expected)
 
     def test_stock_source_failure_uses_fallback_only_once_per_run(self):
         config = m.Config([self.stock])
@@ -554,7 +558,8 @@ class GlobalQuoteTests(unittest.TestCase):
             _, content = m.build_message(quote.fetched_at, [(instrument, None, quote)], [], m.Config([instrument]))
             self.assertIn("港元/股" if currency == "HKD" else "元/股", content)
             if market == "hk_connect":
-                self.assertIn("非人民币结算价", content)
+                self.assertIn("非人民币结算价", " ".join(quote.notes))
+                self.assertNotIn("非人民币结算价", content)
 
     def test_us_quote_timestamp_and_class_symbols(self):
         instrument = m.Instrument("us_share", "BRK.B")
@@ -585,7 +590,7 @@ class GlobalQuoteTests(unittest.TestCase):
 
     def test_crypto_units_low_prices_and_rolling_change(self):
         instant = at("2026-11-16T10:30:00")
-        cases = [("BTC/USDT", "63714.42000000", "63,714.42", "USDT/BTC"), ("SHIB/USDT", "0.00000390", "0.0000039", "USDT/SHIB"), ("ETH/BTC", "0.02834000", "0.02834", "BTC/ETH")]
+        cases = [("BTC/USDT", "63714.42000000", "63,714.42", "USDT"), ("SHIB/USDT", "0.00000390", "0.0000039", "USDT"), ("ETH/BTC", "0.02834000", "0.02834", "BTC")]
         for symbol, raw, expected, unit in cases:
             with self.subTest(symbol=symbol):
                 item = m.Instrument("crypto", symbol)
@@ -593,9 +598,7 @@ class GlobalQuoteTests(unittest.TestCase):
                 quote = m.crypto_quote(item, payload, instant, "Binance")
                 title, content = m.build_message(instant, [(item, None, quote)], [], m.Config([item]))
                 self.assertIn("多市场行情", title)
-                self.assertIn("现价：" + expected + " " + unit, content)
-                self.assertIn("24h 涨跌幅：-1.25%", content)
-                self.assertNotIn("美元", content)
+                self.assertEqual(content, f"{symbol}｜{expected} {unit}｜24h -1.25%")
                 self.assertEqual(quote.quoted_at, instant)
 
     def test_crypto_midnight_does_not_create_a_false_previous_session_warning(self):
@@ -603,7 +606,7 @@ class GlobalQuoteTests(unittest.TestCase):
         now = at("2026-11-17T00:00:00")
         session = m.CalendarStore(m.Config([item]), Path("unused")).session("crypto", now)
         quote = m.Quote(item, 63000, "test", now, now - timedelta(seconds=2))
-        self.assertNotIn("上一时段", " ".join(m.quote_status(quote, session, 10)))
+        self.assertEqual(m.quote_status(quote, session, 10), "")
 
     def test_okx_timestamp_and_change_are_24h_and_spot_only(self):
         instant = at("2026-11-16T10:30:00")
@@ -641,6 +644,9 @@ class GlobalQuoteTests(unittest.TestCase):
                 quote = provider.fetch(item, None)
                 self.assertIn("OKX", quote.source)
                 self.assertIn("各交易所价格可能不同", " ".join(quote.notes))
+                _, content = m.build_message(quote.fetched_at, [(item, None, quote)], [], m.Config(items))
+                self.assertIn("备用源 OKX", content)
+                self.assertNotIn("各交易所价格可能不同", content)
         self.assertEqual(sum("binance" in call.args[0] for call in get.call_args_list), 1)
 
     def test_missing_crypto_pair_does_not_disable_binance_for_other_pairs(self):
@@ -711,12 +717,10 @@ class ExecutionTests(unittest.TestCase):
 
     def test_lunch_and_night_push_only_gold(self):
         for instant in ("2026-11-16T12:00:00", "2026-11-14T01:30:00"):
-            self.run_script(instant, dry_run=True)
-            message = self.output.getvalue().split("播报时点：", 1)[1]
+            self.assertEqual(self.run_script(instant), 0)
+            message = self.notify.call_args.args[1]
             self.assertIn("Au99.99", message)
             self.assertNotIn("sz000001", message)
-            self.output.seek(0)
-            self.output.truncate(0)
 
     def test_outside_hours_never_fetch(self):
         for instant in ("2026-11-15T10:00:00", "2026-11-16T18:00:00"):
@@ -740,6 +744,11 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn("Au99.99", content)
         self.assertIn("sz000001", content)
         self.assertIn("休市", content)
+        self.assertEqual(len(content.splitlines()), 2)
+        for detail in ("播报时点", "行情时间", "获取时间", "来源", "延迟"):
+            self.assertNotIn(detail, content)
+        for detail in ("行情时间：2026-11-16 10:00:00", "获取时间：2026-11-16 10:00:05", "来源：test"):
+            self.assertIn(detail, self.output.getvalue())
         self.assertNotIn("last_slot", m.read_json(self.path / "state.json"))
 
     def test_manual_run_does_not_consume_or_overwrite_scheduled_slot(self):
